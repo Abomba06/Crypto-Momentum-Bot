@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+*.pyo
+*.pyd
+*.pdb
+*.so
+*.dll
+*.dylib
+
+# Virtual environment
+venv/
+.env/
+.env*/  
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE configs
+.vscode/
+.idea/
+
+# Secrets
+*.key
+*.pem
+*.crt
+*.cert
+*.json
+*.ini
+
+# Custom
+.env        # your Alpaca keys go here, never push them
+*.csv       # trade logs or exports
