@@ -1,0 +1,5 @@
+alpaca-py
+backtrader
+pandas
+yfinance
+python-dotenv
