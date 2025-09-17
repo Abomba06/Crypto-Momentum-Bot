@@ -1,85 +1,107 @@
-# app/crypto_trader_pro.py
 import os, time, math, csv
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 load_dotenv()
 
-# ----------------------- ENV / CONFIG ----------------------------------------
+
 SYMBOLS = [s.strip() for s in os.getenv("CRYPTO_SYMBOLS", "BTC/USD,ETH/USD,SOL/USD").split(",") if s.strip()]
 
-TF_RAW  = os.getenv("CRYPTO_TIMEFRAME", "minute").lower()   # minute | hour | day
-HTF_RAW = os.getenv("HTF_TIMEFRAME", "day").lower()         # higher timeframe for trend filter
+TF_RAW  = os.getenv("CRYPTO_TIMEFRAME", "5Min").strip()
+HTF_RAW = os.getenv("HTF_TIMEFRAME", "15Min").strip()
 
-DONCHIAN  = int(os.getenv("DONCHIAN", "30"))                # breakout lookback (bars)
-ATR_LEN   = int(os.getenv("ATR_LEN", "14"))
-STOP_ATR  = float(os.getenv("STOP_ATR", "1.5"))             # base stop = ATR * STOP_ATR
-TP_MULT   = float(os.getenv("TP_MULT", "1.6"))              # take profit distance = (ATR * STOP_ATR) * TP_MULT
-TRAIL_ATR = float(os.getenv("TRAIL_ATR", "1.0"))            # trailing stop = last - ATR*TRAIL_ATR (tightens stop on gains)
+DONCHIAN  = int(os.getenv("DONCHIAN", "10"))
+ATR_LEN   = int(os.getenv("ATR_LEN", "10"))
+STOP_ATR  = float(os.getenv("STOP_ATR", "1.6"))
+TP_MULT   = float(os.getenv("TP_MULT", "1.6"))
+TRAIL_ATR = float(os.getenv("TRAIL_ATR", "1.2"))  # for trailing stop
 
-RISK_PCT      = float(os.getenv("RISK_PCT", "0.005"))       # risk per entry ~0.5% of equity (conservative)
-PER_COIN_CAP  = float(os.getenv("PER_COIN_CAP", "150"))     # max $ per coin
-PORTFOLIO_CAP = float(os.getenv("PORTFOLIO_CAP", "0.20"))   # max % equity deployed across all open positions
-
-COOLDOWN_MIN   = int(os.getenv("COOLDOWN_MIN", "60"))       # cooldown after a stopped-out loss
-DAILY_DD_LIMIT = float(os.getenv("DAILY_DD_LIMIT", "0.03")) # stop for the day at -3% drawdown
-REGIME_VOL_MIN = float(os.getenv("REGIME_VOL_MIN", "1.0"))  # min ATR% of price to allow entries (filters dead chop)
+RISK_PCT       = float(os.getenv("RISK_PCT", "0.02"))
+PER_COIN_CAP   = float(os.getenv("PER_COIN_CAP", "600"))
+PORTFOLIO_CAP  = float(os.getenv("PORTFOLIO_CAP", "0.50"))
+COOLDOWN_MIN   = int(os.getenv("COOLDOWN_MIN", "3"))
+DAILY_DD_LIMIT = float(os.getenv("DAILY_DD_LIMIT", "0.05"))
+REGIME_VOL_MIN = float(os.getenv("REGIME_VOL_MIN", "1.5"))  # ATR% of price
+MAX_HOLD_BARS  = int(os.getenv("MAX_HOLD_BARS", "20"))
 
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
-TRADE_LOG = os.path.join(LOG_DIR, "trades.csv")
+TRADE_LOG = os.path.join(LOG_DIR, "trades_v2.csv")
 
-# ----------------------- ALPACA CLIENTS --------------------------------------
+
+
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.common.exceptions import APIError
 import requests
 import pandas as pd
-import numpy as np
 
 from app.config import ALPACA_KEY_ID, ALPACA_SECRET_KEY
 
 trading = TradingClient(ALPACA_KEY_ID, ALPACA_SECRET_KEY, paper=True)
 data    = CryptoHistoricalDataClient()
 
-# ----------------------- STATE ----------------------------------------------
-LAST_QTY         = {s: 0.0 for s in SYMBOLS}   # cached qty per symbol for hiccups
-COOLDOWN_UNTIL   = {s: datetime.min.replace(tzinfo=timezone.utc) for s in SYMBOLS}
-DAY_START_EQUITY = None                        # (ts, equity) at start of UTC day
-LOSS_TODAY       = {}                          # running P/L per symbol (approx) for per-coin breaker
 
-# ----------------------- HELPERS --------------------------------------------
-def now_utc():
+
+
+LAST_QTY         = {s: 0.0 for s in SYMBOLS}
+COOLDOWN_UNTIL   = {s: datetime.min.replace(tzinfo=timezone.utc) for s in SYMBOLS}
+DAY_START_EQUITY = None
+LOSS_TODAY       = {}
+POS_STATE        = {s: {"half_taken": False, "entry_ts": None} for s in SYMBOLS}
+
+
+
+
+
+def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 def tf_from_str(s: str) -> TimeFrame:
-    s = s.lower().strip()
-    if s == "minute": return TimeFrame.Minute
-    if s == "hour":   return TimeFrame.Hour
-    if s == "day":    return TimeFrame.Day
-    # default safe fallback
+    s = s.lower()
+    if s in ("minute", "1min", "1m"): return TimeFrame.Minute
+    if s in ("hour", "1h"):            return TimeFrame.Hour
+    if s in ("day", "1d"):             return TimeFrame.Day
+    if s.endswith("min"):
+        try:
+            n = int(s.replace("min", ""))
+            return TimeFrame(n, TimeFrameUnit.Minute)
+        except Exception:
+            return TimeFrame.Minute
     return TimeFrame.Minute
+
+def tf_minutes(tf: TimeFrame) -> int:
+    try:
+        if hasattr(tf, "amount") and tf.unit == TimeFrameUnit.Minute:
+            return int(tf.amount)
+    except Exception:
+        pass
+    if tf == TimeFrame.Minute: return 1
+    if tf == TimeFrame.Hour:   return 60
+    if tf == TimeFrame.Day:    return 60*24
+    return 1
 
 TF  = tf_from_str(TF_RAW)
 HTF = tf_from_str(HTF_RAW)
+TF_MINUTES = tf_minutes(TF)
 
 def bar_history(symbol: str, timeframe: TimeFrame, lookback_bars: int) -> pd.DataFrame:
     """Fetch OHLCV bars for symbol/timeframe, return last `lookback_bars` rows."""
     end = now_utc()
-    # generous window so we always have enough bars even if API skips some minutes
-    days = 3
-    if timeframe == TimeFrame.Hour: days = max(5, int(lookback_bars / 12) + 3)
-    if timeframe == TimeFrame.Day:  days = max(365, lookback_bars + 5)
-
-    start = end - timedelta(days=days)
-    df = data.get_crypto_bars(CryptoBarsRequest(
+    if timeframe == TimeFrame.Day:
+        start = end - timedelta(days=lookback_bars + 15)
+    elif timeframe == TimeFrame.Hour:
+        start = end - timedelta(days=max(7, int(lookback_bars/12) + 3))
+    else:
+        start = end - timedelta(days=3)
+    resp = data.get_crypto_bars(CryptoBarsRequest(
         symbol_or_symbols=symbol, timeframe=timeframe, start=start, end=end
-    )).df
-
+    ))
+    df = resp.df
     if hasattr(df, "xs"):
         try:
             df = df.xs(symbol)
@@ -95,17 +117,6 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
 
 def donchian(df: pd.DataFrame, n: int):
     return df["high"].rolling(n).max(), df["low"].rolling(n).min()
-
-def htf_trend_ok(symbol: str) -> bool:
-    """Require HTF SMA50 > SMA200 to allow long entries."""
-    bars = bar_history(symbol, HTF, 220)
-    if len(bars) < 200:
-        print(f"[{now_utc()}] {symbol} HTF not enough bars; skip.")
-        return False
-    s50  = bars["close"].rolling(50).mean().iloc[-1]
-    s200 = bars["close"].rolling(200).mean().iloc[-1]
-    print(f"[{now_utc()}] HTF trend {symbol}: SMA50={s50:.2f}, SMA200={s200:.2f}")
-    return s50 > s200
 
 def get_account():
     return trading.get_account()
@@ -143,12 +154,10 @@ def append_trade_log(row: dict):
         w.writerow(row)
 
 def risk_sized_notional(equity: float) -> float:
-    """Conservative position sizing: ~4x the dollar risk, capped per-coin."""
     dollar_risk = max(5.0, equity * RISK_PCT)
     return min(PER_COIN_CAP, 4.0 * dollar_risk)
 
 def daily_drawdown_hit(acct) -> bool:
-    """Pause for the day if equity drawdown exceeds DAILY_DD_LIMIT."""
     global DAY_START_EQUITY
     ts = now_utc()
     if DAY_START_EQUITY is None or ts.date() != DAY_START_EQUITY[0].date():
@@ -157,11 +166,25 @@ def daily_drawdown_hit(acct) -> bool:
     start_eq = DAY_START_EQUITY[1]
     dd = (float(acct.equity) - start_eq) / max(1e-9, start_eq)
     if dd <= -DAILY_DD_LIMIT:
-        print(f"[{now_utc()}] Daily drawdown {dd:.2%} <= -{DAILY_DD_LIMIT:.0%}. Pausing until UTC midnight.")
+        print(f"[{now_utc()}] Daily drawdown {dd:.2%} ≤ -{DAILY_DD_LIMIT:.0%}. Pausing until UTC midnight.")
         return True
     return False
 
-# ----------------------- CORE PER-SYMBOL LOGIC -------------------------------
+def htf_trend_ok(symbol: str) -> bool:
+    """Require HTF SMA50 > SMA200 to allow long entries."""
+    bars = bar_history(symbol, HTF, 220)
+    if len(bars) < 200:
+        print(f"[{now_utc()}] {symbol} HTF not enough bars; skip.")
+        return False
+    s50  = bars["close"].rolling(50).mean().iloc[-1]
+    s200 = bars["close"].rolling(200).mean().iloc[-1]
+    print(f"[{now_utc()}] HTF trend {symbol}: SMA50={s50:.2f}, SMA200={s200:.2f}")
+    return s50 > s200
+
+
+
+
+
 def manage_symbol(symbol: str, acct, open_positions: dict):
     # Respect cooldown
     if now_utc() < COOLDOWN_UNTIL[symbol]:
@@ -183,76 +206,97 @@ def manage_symbol(symbol: str, acct, open_positions: dict):
     close = bars["close"]
     last  = float(close.iloc[-1])
     hi, lo = donchian(bars, DONCHIAN)
-    # Use previous bar’s levels to avoid same-bar breakout flips
-    upper, lower = float(hi.iloc[-2]), float(lo.iloc[-2])
+    upper, lower = float(hi.iloc[-2]), float(lo.iloc[-2])  # previous bar levels
     atr_val = float(atr(bars, ATR_LEN).iloc[-1])
 
+    # Check if we already hold
     qty = qty_for_symbol(symbol)
     wanted = symbol.replace("/", "")
     pos = open_positions.get(symbol) or open_positions.get(wanted)
 
-    # -------- manage open long --------
-    if qty > 0 and pos is not None:
-        avg  = float(pos.avg_entry_price)
-        base_stop = avg - STOP_ATR * atr_val
-        tp        = avg + (STOP_ATR * TP_MULT) * atr_val
+ 
+ 
 
-        # Trailing stop (ratchets up as price rises)
+    if qty > 0 and pos is not None:
+        avg = float(pos.avg_entry_price)
+        r   = STOP_ATR * atr_val
+
+        # base stop + trailing stop
+        base_stop  = avg - r
         trail_stop = last - TRAIL_ATR * atr_val
         stop = max(base_stop, trail_stop)
 
-        print(f"[{now_utc()}] {symbol} pos qty={qty}, last={last:.6f}, avg={avg:.6f}, "
-              f"stop={stop:.6f}, tp={tp:.6f} (ATR={atr_val:.6f})")
+        # TPs and time-based exit
+        tp1 = avg + r
+        tp2 = avg + r * TP_MULT
+        ent_ts = POS_STATE[symbol]["entry_ts"]
+        max_hold_sec = MAX_HOLD_BARS * TF_MINUTES * 60
+        timed_out = ent_ts and (now_utc() - ent_ts).total_seconds() >= max_hold_sec
 
-        # Exit on stop or take-profit
-        if last <= stop or last >= tp:
+        print(f"[{now_utc()}] {symbol} qty={qty}, last={last:.6f}, avg={avg:.6f}, "
+              f"stop={stop:.6f}, tp1={tp1:.6f}, tp2={tp2:.6f} (ATR={atr_val:.6f})")
+
+        # take 50% at +1R
+        if (not POS_STATE[symbol]["half_taken"]) and last >= tp1:
+            try:
+                sell_qty = qty * 0.5
+                place_market(symbol, "SELL", qty=sell_qty, tif=TimeInForce.GTC)
+                POS_STATE[symbol]["half_taken"] = True
+                append_trade_log({
+                    "ts": now_utc().isoformat(), "symbol": symbol, "action": "TP1",
+                    "price_last": last, "avg_entry": avg, "qty": sell_qty
+                })
+                print(f"[{now_utc()}] TP1 hit {symbol}: sold 50% ({sell_qty}).")
+                return
+            except Exception as e:
+                print(f"[{now_utc()}] TP1 order error {symbol}: {e}")
+
+        # exit on stop / tp2 / timeout
+        if last <= stop or last >= tp2 or timed_out:
+            reason = "stop" if last <= stop else ("tp2" if last >= tp2 else "timeout")
             try:
                 place_market(symbol, "SELL", qty=qty, tif=TimeInForce.GTC)
-                print(f"[{now_utc()}] EXIT {symbol} at market (stop/tp).")
                 pnl_est = (last - avg) * qty
-                # per-coin running loss breaker
                 LOSS_TODAY[symbol] = LOSS_TODAY.get(symbol, 0.0) + pnl_est
                 if last <= stop and LOSS_TODAY[symbol] <= -(PER_COIN_CAP * 0.5):
                     COOLDOWN_UNTIL[symbol] = now_utc() + timedelta(hours=6)
                     print(f"[{now_utc()}] {symbol} hit per-coin loss limit; cooling 6h.")
                 append_trade_log({
-                    "ts": now_utc().isoformat(),
-                    "symbol": symbol,
-                    "action": "EXIT",
-                    "price_last": last,
-                    "avg_entry": avg,
-                    "stop": stop,
-                    "tp": tp,
-                    "qty": qty
+                    "ts": now_utc().isoformat(), "symbol": symbol, "action": "EXIT",
+                    "price_last": last, "avg_entry": avg, "stop": stop, "tp2": tp2,
+                    "qty": qty, "reason": reason
                 })
+                print(f"[{now_utc()}] EXIT {symbol} at market ({reason}).")
             except Exception as e:
                 print(f"[{now_utc()}] order error exit {symbol}: {e}")
         return
 
-    # -------- flat -> consider entry --------
-    # Higher-timeframe trend filter
+
+
+
+    # HTF filter (trend)
     if not htf_trend_ok(symbol):
         print(f"[{now_utc()}] {symbol} HTF trend not OK; skip entry.")
         return
 
-    # Regime filter: require enough volatility (ATR% of price)
+    # Regime filter by volatility
     vol_pct = (atr_val / max(1e-9, last)) * 100.0
     if vol_pct < REGIME_VOL_MIN:
         print(f"[{now_utc()}] {symbol} regime filter: ATR%={vol_pct:.2f} < {REGIME_VOL_MIN:.2f}. Skip.")
         return
 
-    # Breakout entry (long only): last > prior upper band
+    # Donchian breakout: last > prior upper band
     if last > upper:
         equity = float(acct.equity)
         cash   = float(acct.cash)
 
-        # portfolio cap: sum current deployed market value
         deployed = 0.0
         try:
             for p in trading.get_all_positions():
                 deployed += float(p.market_value)
         except Exception:
             pass
+
         if deployed > equity * PORTFOLIO_CAP:
             print(f"[{now_utc()}] portfolio cap reached ({deployed/equity:.2%}). Skip {symbol}.")
             return
@@ -265,7 +309,8 @@ def manage_symbol(symbol: str, acct, open_positions: dict):
 
         try:
             place_market(symbol, "BUY", notional=round(notional, 2), tif=TimeInForce.GTC)
-            print(f"[{now_utc()}] ENTRY {symbol} BUY ${notional:.2f} (Donchian{DONCHIAN} breakout).")
+            POS_STATE[symbol]["half_taken"] = False
+            POS_STATE[symbol]["entry_ts"]   = now_utc()
             append_trade_log({
                 "ts": now_utc().isoformat(),
                 "symbol": symbol,
@@ -275,16 +320,18 @@ def manage_symbol(symbol: str, acct, open_positions: dict):
                 "atr": atr_val,
                 "notional": notional
             })
+            print(f"[{now_utc()}] ENTRY {symbol} BUY ${notional:.2f} (Donchian{DONCHIAN} breakout).")
         except Exception as e:
             print(f"[{now_utc()}] order error entry {symbol}: {e}")
     else:
         print(f"[{now_utc()}] HOLD {symbol} last={last:.6f} upper={upper:.6f}")
 
-# ----------------------- MAIN LOOP ------------------------------------------
+
+
+
 def run_loop(poll_sec: int = 60, heartbeat_sec: int = 300):
     last_heart = 0.0
-    print(f"[{now_utc()}] PRO crypto bot running on {SYMBOLS} "
-          f"[TF={TF_RAW}, HTF={HTF_RAW}] (paper).")
+    print(f"[{now_utc()}] V2 crypto bot running on {SYMBOLS} [TF={TF_RAW}, HTF={HTF_RAW}] (paper).")
 
     while True:
         t0 = time.time()

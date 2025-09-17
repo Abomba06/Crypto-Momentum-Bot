@@ -38,5 +38,5 @@ Thumbs.db
 *.ini
 
 # Custom
-.env        # your Alpaca keys go here, never push them
-*.csv       # trade logs or exports
+.env        
+*.csv       

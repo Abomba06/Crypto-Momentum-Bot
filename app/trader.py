@@ -1,4 +1,4 @@
-# app/trader.py
+# app/trader.py for stocks and ELAs 
 import math, time
 from datetime import datetime, timedelta, timezone
 
@@ -15,11 +15,11 @@ import requests
 from app.config import ALPACA_KEY_ID, ALPACA_SECRET_KEY, SYMBOL, FAST, SLOW, RISK_PCT
 from app.risk import notional_from_cash, clamp_position
 
-# --- clients -----------------------------------------------------------------
+
 trading = TradingClient(ALPACA_KEY_ID, ALPACA_SECRET_KEY, paper=True)
 data    = StockHistoricalDataClient(ALPACA_KEY_ID, ALPACA_SECRET_KEY)
 
-# --- helpers -----------------------------------------------------------------
+
 def market_clock():
     """Get Alpaca market clock; tolerate older alpaca-py without timeout kwarg."""
     try:
@@ -78,7 +78,7 @@ def place_market(side, *, notional=None, qty=None):
     )
     trading.submit_order(req)
 
-# --- main loop with retries + heartbeats -------------------------------------
+
 def run_loop(poll_sec=60, heartbeat_sec=300, max_portfolio_pct=0.20):
     last_heartbeat = 0.0
     print(f"[{datetime.now()}] Bot running for {SYMBOL}. Poll every {poll_sec}s. Paper account.")
@@ -86,7 +86,6 @@ def run_loop(poll_sec=60, heartbeat_sec=300, max_portfolio_pct=0.20):
     while True:
         now_ts = time.time()
 
-        # Robust clock fetch with retry/backoff
         for attempt in range(3):
             try:
                 clk = market_clock()
