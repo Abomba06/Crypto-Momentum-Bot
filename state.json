@@ -1,0 +1,162 @@
+{
+  "cash": 100000.0,
+  "equity": 100000.0,
+  "positions": {
+    "BTC/USD": {
+      "qty": 0.0,
+      "avg_entry": null,
+      "stop": null,
+      "tp1": null,
+      "tp2": null
+    },
+    "ETH/USD": {
+      "qty": 0.0,
+      "avg_entry": null,
+      "stop": null,
+      "tp1": null,
+      "tp2": null
+    },
+    "SOL/USD": {
+      "qty": 0.0,
+      "avg_entry": null,
+      "stop": null,
+      "tp1": null,
+      "tp2": null
+    },
+    "XRP/USD": {
+      "qty": 0.0,
+      "avg_entry": null,
+      "stop": null,
+      "tp1": null,
+      "tp2": null
+    },
+    "LINK/USD": {
+      "qty": 0.0,
+      "avg_entry": null,
+      "stop": null,
+      "tp1": null,
+      "tp2": null
+    },
+    "AVAX/USD": {
+      "qty": 0.0,
+      "avg_entry": null,
+      "stop": null,
+      "tp1": null,
+      "tp2": null
+    },
+    "DOGE/USD": {
+      "qty": 0.0,
+      "avg_entry": null,
+      "stop": null,
+      "tp1": null,
+      "tp2": null
+    },
+    "LTC/USD": {
+      "qty": 0.0,
+      "avg_entry": null,
+      "stop": null,
+      "tp1": null,
+      "tp2": null
+    },
+    "UNI/USD": {
+      "qty": 0.0,
+      "avg_entry": null,
+      "stop": null,
+      "tp1": null,
+      "tp2": null
+    },
+    "ADA/USD": {
+      "qty": 0.0,
+      "avg_entry": null,
+      "stop": null,
+      "tp1": null,
+      "tp2": null
+    },
+    "MATIC/USD": {
+      "qty": 0.0,
+      "avg_entry": null,
+      "stop": null,
+      "tp1": null,
+      "tp2": null
+    }
+  },
+  "sym": {
+    "BTC/USD": {
+      "prev_price": null,
+      "last_fire_ts": null,
+      "tp1_hit": false,
+      "warm_ltf_ok": false,
+      "warm_htf_ok": false
+    },
+    "ETH/USD": {
+      "prev_price": null,
+      "last_fire_ts": null,
+      "tp1_hit": false,
+      "warm_ltf_ok": false,
+      "warm_htf_ok": false
+    },
+    "SOL/USD": {
+      "prev_price": null,
+      "last_fire_ts": null,
+      "tp1_hit": false,
+      "warm_ltf_ok": false,
+      "warm_htf_ok": false
+    },
+    "XRP/USD": {
+      "prev_price": null,
+      "last_fire_ts": null,
+      "tp1_hit": false,
+      "warm_ltf_ok": false,
+      "warm_htf_ok": false
+    },
+    "LINK/USD": {
+      "prev_price": null,
+      "last_fire_ts": null,
+      "tp1_hit": false,
+      "warm_ltf_ok": false,
+      "warm_htf_ok": false
+    },
+    "AVAX/USD": {
+      "prev_price": null,
+      "last_fire_ts": null,
+      "tp1_hit": false,
+      "warm_ltf_ok": false,
+      "warm_htf_ok": false
+    },
+    "DOGE/USD": {
+      "prev_price": null,
+      "last_fire_ts": null,
+      "tp1_hit": false,
+      "warm_ltf_ok": false,
+      "warm_htf_ok": false
+    },
+    "LTC/USD": {
+      "prev_price": null,
+      "last_fire_ts": null,
+      "tp1_hit": false,
+      "warm_ltf_ok": false,
+      "warm_htf_ok": false
+    },
+    "UNI/USD": {
+      "prev_price": null,
+      "last_fire_ts": null,
+      "tp1_hit": false,
+      "warm_ltf_ok": false,
+      "warm_htf_ok": false
+    },
+    "ADA/USD": {
+      "prev_price": null,
+      "last_fire_ts": null,
+      "tp1_hit": false,
+      "warm_ltf_ok": false,
+      "warm_htf_ok": false
+    },
+    "MATIC/USD": {
+      "prev_price": null,
+      "last_fire_ts": null,
+      "tp1_hit": false,
+      "warm_ltf_ok": false,
+      "warm_htf_ok": false
+    }
+  }
+}
