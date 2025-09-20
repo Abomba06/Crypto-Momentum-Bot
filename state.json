@@ -82,67 +82,67 @@
   },
   "sym": {
     "BTC/USD": {
-      "prev_price": null,
+      "prev_price": 115813.6945,
       "last_fire_ts": null,
       "tp1_hit": false,
-      "warm_ltf_ok": false,
-      "warm_htf_ok": false
+      "warm_ltf_ok": true,
+      "warm_htf_ok": true
     },
     "ETH/USD": {
-      "prev_price": null,
+      "prev_price": 4479.6,
       "last_fire_ts": null,
       "tp1_hit": false,
-      "warm_ltf_ok": false,
-      "warm_htf_ok": false
+      "warm_ltf_ok": true,
+      "warm_htf_ok": true
     },
     "SOL/USD": {
-      "prev_price": null,
+      "prev_price": 238.7465,
       "last_fire_ts": null,
       "tp1_hit": false,
-      "warm_ltf_ok": false,
-      "warm_htf_ok": false
+      "warm_ltf_ok": true,
+      "warm_htf_ok": true
     },
     "XRP/USD": {
-      "prev_price": null,
+      "prev_price": 2.974685,
       "last_fire_ts": null,
       "tp1_hit": false,
-      "warm_ltf_ok": false,
-      "warm_htf_ok": false
+      "warm_ltf_ok": true,
+      "warm_htf_ok": true
     },
     "LINK/USD": {
-      "prev_price": null,
+      "prev_price": 23.2825,
       "last_fire_ts": null,
       "tp1_hit": false,
-      "warm_ltf_ok": false,
-      "warm_htf_ok": false
+      "warm_ltf_ok": true,
+      "warm_htf_ok": true
     },
     "AVAX/USD": {
-      "prev_price": null,
+      "prev_price": 33.196,
       "last_fire_ts": null,
       "tp1_hit": false,
-      "warm_ltf_ok": false,
-      "warm_htf_ok": false
+      "warm_ltf_ok": true,
+      "warm_htf_ok": true
     },
     "DOGE/USD": {
-      "prev_price": null,
+      "prev_price": 0.266598,
       "last_fire_ts": null,
       "tp1_hit": false,
-      "warm_ltf_ok": false,
-      "warm_htf_ok": false
+      "warm_ltf_ok": true,
+      "warm_htf_ok": true
     },
     "LTC/USD": {
-      "prev_price": null,
+      "prev_price": 113.69,
       "last_fire_ts": null,
       "tp1_hit": false,
-      "warm_ltf_ok": false,
-      "warm_htf_ok": false
+      "warm_ltf_ok": true,
+      "warm_htf_ok": true
     },
     "UNI/USD": {
-      "prev_price": null,
+      "prev_price": 9.15875,
       "last_fire_ts": null,
       "tp1_hit": false,
-      "warm_ltf_ok": false,
-      "warm_htf_ok": false
+      "warm_ltf_ok": true,
+      "warm_htf_ok": true
     },
     "ADA/USD": {
       "prev_price": null,
@@ -158,5 +158,10 @@
       "warm_ltf_ok": false,
       "warm_htf_ok": false
     }
+  },
+  "daily": {
+    "date": "2025-09-20",
+    "start_equity": 100000.0,
+    "halt": false
   }
 }
