@@ -1,5 +1,7 @@
-alpaca-py
-backtrader
-pandas
-yfinance
-python-dotenv
+alpaca-py==0.42.0
+backtrader==1.9.78.123
+numpy==2.3.2
+pandas==2.3.2
+python-dotenv==1.1.1
+requests==2.32.5
+yfinance==0.2.65

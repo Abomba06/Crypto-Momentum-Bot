@@ -1,166 +1,80 @@
 {
   "cash": 100000.0,
   "equity": 100000.0,
-  "positions": {
-    "BTC/USD": {
-      "qty": 0.0,
-      "avg_entry": null,
-      "stop": null,
-      "tp1": null,
-      "tp2": null
-    },
-    "ETH/USD": {
-      "qty": 0.0,
-      "avg_entry": null,
-      "stop": null,
-      "tp1": null,
-      "tp2": null
-    },
-    "SOL/USD": {
-      "qty": 0.0,
-      "avg_entry": null,
-      "stop": null,
-      "tp1": null,
-      "tp2": null
-    },
-    "XRP/USD": {
-      "qty": 0.0,
-      "avg_entry": null,
-      "stop": null,
-      "tp1": null,
-      "tp2": null
-    },
-    "LINK/USD": {
-      "qty": 0.0,
-      "avg_entry": null,
-      "stop": null,
-      "tp1": null,
-      "tp2": null
-    },
-    "AVAX/USD": {
-      "qty": 0.0,
-      "avg_entry": null,
-      "stop": null,
-      "tp1": null,
-      "tp2": null
-    },
-    "DOGE/USD": {
-      "qty": 0.0,
-      "avg_entry": null,
-      "stop": null,
-      "tp1": null,
-      "tp2": null
-    },
-    "LTC/USD": {
-      "qty": 0.0,
-      "avg_entry": null,
-      "stop": null,
-      "tp1": null,
-      "tp2": null
-    },
-    "UNI/USD": {
-      "qty": 0.0,
-      "avg_entry": null,
-      "stop": null,
-      "tp1": null,
-      "tp2": null
-    },
-    "ADA/USD": {
-      "qty": 0.0,
-      "avg_entry": null,
-      "stop": null,
-      "tp1": null,
-      "tp2": null
-    },
-    "MATIC/USD": {
-      "qty": 0.0,
-      "avg_entry": null,
-      "stop": null,
-      "tp1": null,
-      "tp2": null
-    }
-  },
   "sym": {
     "BTC/USD": {
-      "prev_price": 115813.6945,
+      "prev_price": 66479.385,
       "last_fire_ts": null,
       "tp1_hit": false,
       "warm_ltf_ok": true,
       "warm_htf_ok": true
     },
     "ETH/USD": {
-      "prev_price": 4479.6,
+      "prev_price": 2051.728,
       "last_fire_ts": null,
       "tp1_hit": false,
       "warm_ltf_ok": true,
       "warm_htf_ok": true
     },
     "SOL/USD": {
-      "prev_price": 238.7465,
-      "last_fire_ts": null,
-      "tp1_hit": false,
-      "warm_ltf_ok": true,
-      "warm_htf_ok": true
-    },
-    "XRP/USD": {
-      "prev_price": 2.974685,
-      "last_fire_ts": null,
-      "tp1_hit": false,
-      "warm_ltf_ok": true,
-      "warm_htf_ok": true
-    },
-    "LINK/USD": {
-      "prev_price": 23.2825,
-      "last_fire_ts": null,
-      "tp1_hit": false,
-      "warm_ltf_ok": true,
-      "warm_htf_ok": true
-    },
-    "AVAX/USD": {
-      "prev_price": 33.196,
+      "prev_price": 79.282,
       "last_fire_ts": null,
       "tp1_hit": false,
       "warm_ltf_ok": true,
       "warm_htf_ok": true
     },
     "DOGE/USD": {
-      "prev_price": 0.266598,
+      "prev_price": 0.090275,
       "last_fire_ts": null,
       "tp1_hit": false,
       "warm_ltf_ok": true,
       "warm_htf_ok": true
     },
-    "LTC/USD": {
-      "prev_price": 113.69,
+    "AVAX/USD": {
+      "prev_price": 8.771445,
       "last_fire_ts": null,
       "tp1_hit": false,
       "warm_ltf_ok": true,
       "warm_htf_ok": true
     },
-    "UNI/USD": {
-      "prev_price": 9.15875,
+    "LINK/USD": {
+      "prev_price": 8.632,
       "last_fire_ts": null,
       "tp1_hit": false,
       "warm_ltf_ok": true,
       "warm_htf_ok": true
     },
     "ADA/USD": {
-      "prev_price": null,
+      "prev_price": 0.239785,
       "last_fire_ts": null,
       "tp1_hit": false,
-      "warm_ltf_ok": false,
-      "warm_htf_ok": false
+      "warm_ltf_ok": true,
+      "warm_htf_ok": true
     },
-    "MATIC/USD": {
-      "prev_price": null,
+    "UNI/USD": {
+      "prev_price": 3.20152,
       "last_fire_ts": null,
       "tp1_hit": false,
-      "warm_ltf_ok": false,
-      "warm_htf_ok": false
+      "warm_ltf_ok": true,
+      "warm_htf_ok": true
+    },
+    "LTC/USD": {
+      "prev_price": 52.2225,
+      "last_fire_ts": null,
+      "tp1_hit": false,
+      "warm_ltf_ok": true,
+      "warm_htf_ok": true
+    },
+    "XRP/USD": {
+      "prev_price": 1.307325,
+      "last_fire_ts": null,
+      "tp1_hit": false,
+      "warm_ltf_ok": true,
+      "warm_htf_ok": true
     }
   },
   "daily": {
-    "date": "2025-09-20",
+    "date": "2026-04-03",
     "start_equity": 100000.0,
     "halt": false
   }

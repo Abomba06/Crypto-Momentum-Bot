@@ -1,156 +1,163 @@
-# app/trader.py for stocks and ELAs 
-import math, time
+import math
+import time
 from datetime import datetime, timedelta, timezone
 
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+import requests
+from alpaca.common.exceptions import APIError
+from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed
-from alpaca.common.exceptions import APIError
-import requests
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest
 
-from app.config import ALPACA_KEY_ID, ALPACA_SECRET_KEY, SYMBOL, FAST, SLOW, RISK_PCT
-from app.risk import notional_from_cash, clamp_position
+from app.config import ALPACA_KEY_ID, ALPACA_SECRET_KEY, APCA_API_BASE_URL, FAST, RISK_PCT, SLOW, SYMBOL
+from app.risk import clamp_position, notional_from_cash
 
 
-trading = TradingClient(ALPACA_KEY_ID, ALPACA_SECRET_KEY, paper=True)
-data    = StockHistoricalDataClient(ALPACA_KEY_ID, ALPACA_SECRET_KEY)
+trading = TradingClient(
+    ALPACA_KEY_ID,
+    ALPACA_SECRET_KEY,
+    paper=True,
+    url_override=APCA_API_BASE_URL or None,
+)
+data = StockHistoricalDataClient(ALPACA_KEY_ID, ALPACA_SECRET_KEY)
+
+
+def log(message: str) -> None:
+    print(f"[{datetime.now()}] {message}")
 
 
 def market_clock():
-    """Get Alpaca market clock; tolerate older alpaca-py without timeout kwarg."""
     try:
-        return trading.get_clock(timeout=10)  # recent alpaca-py
+        return trading.get_clock(timeout=10)
     except TypeError:
-        return trading.get_clock()            # older versions
+        return trading.get_clock()
+
 
 def market_is_open() -> bool:
-    clk = market_clock()
-    return bool(getattr(clk, "is_open", False))
+    return bool(getattr(market_clock(), "is_open", False))
 
-def last_n_closes(n=250):
-    """Fetch recent daily closes using IEX feed (free/paper)."""
+
+def last_n_closes(n: int = 250):
     end = datetime.now(timezone.utc)
-    start = end - timedelta(days=n*2)  # buffer weekends/holidays
-    bars = data.get_stock_bars(StockBarsRequest(
-        symbol_or_symbols=SYMBOL,
-        timeframe=TimeFrame.Day,
-        start=start,
-        end=end,
-        feed=DataFeed.IEX   # use IEX instead of SIP
-    )).df
-    closes = bars.xs(SYMBOL).close if hasattr(bars, "xs") else bars.close
-    return closes
+    start = end - timedelta(days=n * 2)
+    bars = data.get_stock_bars(
+        StockBarsRequest(
+            symbol_or_symbols=SYMBOL,
+            timeframe=TimeFrame.Day,
+            start=start,
+            end=end,
+            feed=DataFeed.IEX,
+        )
+    ).df
+    return bars.xs(SYMBOL).close if hasattr(bars, "xs") else bars.close
 
-def sma(series, n):
+
+def sma(series, n: int):
     return series.rolling(n).mean()
 
-def signal():
+
+def signal() -> str:
     closes = last_n_closes(max(FAST, SLOW) + 5)
-    f_now,  s_now  = sma(closes, FAST).iloc[-1], sma(closes, SLOW).iloc[-1]
-    f_prev, s_prev = sma(closes, FAST).iloc[-2], sma(closes, SLOW).iloc[-2]
+    fast_series = sma(closes, FAST)
+    slow_series = sma(closes, SLOW)
+    fast_now, slow_now = fast_series.iloc[-1], slow_series.iloc[-1]
+    fast_prev, slow_prev = fast_series.iloc[-2], slow_series.iloc[-2]
 
-    # Debug: show SMA values each poll
-    print(f"[{datetime.now()}] Fast SMA={f_now:.2f}, Slow SMA={s_now:.2f}")
+    log(f"Fast SMA={fast_now:.2f}, Slow SMA={slow_now:.2f}")
 
-    if f_prev <= s_prev and f_now > s_now:
+    if fast_prev <= slow_prev and fast_now > slow_now:
         return "BUY"
-    if f_prev >= s_prev and f_now < s_now:
+    if fast_prev >= slow_prev and fast_now < slow_now:
         return "SELL"
     return "HOLD"
 
-def current_qty(symbol=SYMBOL) -> float:
-    for p in trading.get_all_positions():
-        if p.symbol == symbol:
-            return float(p.qty)
+
+def current_qty(symbol: str = SYMBOL) -> float:
+    for position in trading.get_all_positions():
+        if position.symbol == symbol:
+            return float(position.qty)
     return 0.0
 
-def place_market(side, *, notional=None, qty=None):
-    req = MarketOrderRequest(
+
+def place_market(side: str, *, notional=None, qty=None) -> None:
+    request = MarketOrderRequest(
         symbol=SYMBOL,
         side=OrderSide[side],
         time_in_force=TimeInForce.DAY,
         notional=notional,
-        qty=qty
+        qty=qty,
     )
-    trading.submit_order(req)
+    trading.submit_order(request)
 
 
-def run_loop(poll_sec=60, heartbeat_sec=300, max_portfolio_pct=0.20):
+def run_loop(poll_sec: int = 60, heartbeat_sec: int = 300, max_portfolio_pct: float = 0.20) -> None:
     last_heartbeat = 0.0
-    print(f"[{datetime.now()}] Bot running for {SYMBOL}. Poll every {poll_sec}s. Paper account.")
+    log(f"Bot running for {SYMBOL}. Poll every {poll_sec}s. Paper account.")
 
     while True:
         now_ts = time.time()
 
         for attempt in range(3):
             try:
-                clk = market_clock()
+                clock = market_clock()
                 break
-            except (APIError, requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
-                wait = min(30, 5 * (2 ** attempt))  # 5s, 10s, 20s
-                print(f"[{datetime.now()}] Clock fetch error: {e}. Retrying in {wait}s…")
+            except (APIError, requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as exc:
+                wait = min(30, 5 * (2 ** attempt))
+                log(f"Clock fetch error: {exc}. Retrying in {wait}s...")
                 time.sleep(wait)
         else:
-            print(f"[{datetime.now()}] Clock still unreachable. Sleeping {heartbeat_sec}s…")
+            log(f"Clock still unreachable. Sleeping {heartbeat_sec}s...")
             time.sleep(heartbeat_sec)
             continue
 
-        if not getattr(clk, "is_open", False):
-            # Heartbeat while closed
+        if not getattr(clock, "is_open", False):
             if now_ts - last_heartbeat >= heartbeat_sec:
-                nxt = getattr(clk, "next_open", None)
-                print(f"[{datetime.now()}] Waiting for market open… next_open={nxt}")
+                log(f"Waiting for market open. next_open={getattr(clock, 'next_open', None)}")
                 last_heartbeat = now_ts
             time.sleep(poll_sec)
             continue
 
-        # Market is open → trade
         try:
             sig = signal()
-        except (APIError, requests.exceptions.RequestException) as e:
-            print(f"[{datetime.now()}] Data fetch error: {e}. Will retry next loop.")
+        except (APIError, requests.exceptions.RequestException) as exc:
+            log(f"Data fetch error: {exc}. Will retry next loop.")
             time.sleep(poll_sec)
             continue
 
         qty = current_qty()
         try:
-            acct = trading.get_account()
-        except (APIError, requests.exceptions.RequestException) as e:
-            print(f"[{datetime.now()}] Account fetch error: {e}. Will retry next loop.")
+            account = trading.get_account()
+        except (APIError, requests.exceptions.RequestException) as exc:
+            log(f"Account fetch error: {exc}. Will retry next loop.")
             time.sleep(poll_sec)
             continue
 
-        cash, equity = float(acct.cash), float(acct.equity)
+        cash, equity = float(account.cash), float(account.equity)
 
         if sig == "BUY" and qty == 0:
-            target = notional_from_cash(cash, RISK_PCT)
-            target = clamp_position(target, max_portfolio_pct, equity)
+            target = clamp_position(notional_from_cash(cash, RISK_PCT), max_portfolio_pct, equity)
             try:
                 place_market("BUY", notional=target)
-                print(f"[{datetime.now()}] BUY {SYMBOL} ${target}")
-            except (APIError, requests.exceptions.RequestException) as e:
-                print(f"[{datetime.now()}] Order error (BUY): {e}")
+                log(f"BUY {SYMBOL} ${target}")
+            except (APIError, requests.exceptions.RequestException) as exc:
+                log(f"Order error (BUY): {exc}")
         elif sig == "SELL" and qty > 0:
             try:
                 place_market("SELL", qty=math.floor(qty))
-                print(f"[{datetime.now()}] SELL {SYMBOL} x{qty}")
-            except (APIError, requests.exceptions.RequestException) as e:
-                print(f"[{datetime.now()}] Order error (SELL): {e}")
+                log(f"SELL {SYMBOL} x{qty}")
+            except (APIError, requests.exceptions.RequestException) as exc:
+                log(f"Order error (SELL): {exc}")
         else:
-            # Always show decision each loop
-            print(f"[{datetime.now()}] Decision: {sig}, Qty={qty}, Cash=${cash:.2f}")
-
-            # Light heartbeat during open hours
+            log(f"Decision: {sig}, Qty={qty}, Cash=${cash:.2f}")
             if now_ts - last_heartbeat >= heartbeat_sec:
-                nxt_close = getattr(clk, "next_close", None)
-                print(f"[{datetime.now()}] Market open. NextClose={nxt_close}")
+                log(f"Market open. next_close={getattr(clock, 'next_close', None)}")
                 last_heartbeat = now_ts
 
         time.sleep(poll_sec)
+
 
 if __name__ == "__main__":
     run_loop()

@@ -4,6 +4,7 @@ load_dotenv()
 
 ALPACA_KEY_ID     = os.getenv("ALPACA_KEY_ID")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+APCA_API_BASE_URL = os.getenv("APCA_API_BASE_URL", "")
 
 SYMBOL    = os.getenv("SYMBOL", "SPY")
 FAST      = int(os.getenv("FAST", "50"))
