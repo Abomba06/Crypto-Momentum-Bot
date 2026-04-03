@@ -3,6 +3,7 @@ import json
 import math
 import os
 import pathlib
+import sys
 import time
 from copy import deepcopy
 from dataclasses import dataclass
@@ -254,6 +255,35 @@ def write_trade(
                 note,
             ]
         )
+
+
+def print_dashboard(
+    config: BotConfig,
+    state: Dict[str, Any],
+    positions: Dict[str, BrokerPosition],
+    open_order_symbols: Set[str],
+) -> None:
+    timestamp = now_utc().strftime("%Y-%m-%d %H:%M:%S UTC")
+    lines = [
+        "",
+        f"[{timestamp}] Crypto bot running",
+        f"Equity: ${state['equity']:.2f} | Cash: ${state['cash']:.2f} | Universe: {len(config.symbols)} symbols",
+        f"Open order symbols: {', '.join(sorted(open_order_symbols)) if open_order_symbols else 'none'}",
+    ]
+
+    active_positions = [position for position in positions.values() if position.qty > 0]
+    if active_positions:
+        lines.append("Open positions:")
+        for position in sorted(active_positions, key=lambda item: item.symbol):
+            lines.append(
+                f"  {position.symbol}: qty={position.qty:.8f} avg={position.avg_entry_price:.6f} "
+                f"last={position.current_price:.6f} value=${position.market_value:.2f}"
+            )
+    else:
+        lines.append("Open positions: none")
+
+    sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
 
 
 def build_session() -> requests.Session:
@@ -937,6 +967,7 @@ def run_once(
     account = broker.get_account_snapshot()
     state["cash"] = account.cash
     state["equity"] = account.equity
+    print_dashboard(config, state, positions, open_order_symbols)
     save_state(config, state)
     log_line(config, f"Heartbeat: equity=${state['equity']:.2f}, cash=${state['cash']:.2f}")
     return prices_now
