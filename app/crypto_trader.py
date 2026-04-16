@@ -172,6 +172,9 @@ class BotConfig:
     failed_order_cooldown_secs: int
     max_order_retries: int
     thin_liquidity_size_penalty: float
+    reentry_window_secs: int
+    max_reentries_per_symbol: int
+    strategy_kill_switch_enabled: bool
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -305,6 +308,9 @@ class BotConfig:
             failed_order_cooldown_secs=int(os.getenv("FAILED_ORDER_COOLDOWN_SECS", "300")),
             max_order_retries=int(os.getenv("MAX_ORDER_RETRIES", "1")),
             thin_liquidity_size_penalty=float(os.getenv("THIN_LIQUIDITY_SIZE_PENALTY", "0.86")),
+            reentry_window_secs=int(os.getenv("REENTRY_WINDOW_SECS", "1800")),
+            max_reentries_per_symbol=int(os.getenv("MAX_REENTRIES_PER_SYMBOL", "1")),
+            strategy_kill_switch_enabled=os.getenv("STRATEGY_KILL_SWITCH_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
         )
 
 
@@ -522,7 +528,7 @@ def print_dashboard(
         "",
         f"[{timestamp}] Crypto bot running",
         f"Equity: ${state['equity']:.2f} | Cash: ${state['cash']:.2f} | Day PnL: {day_return:+.2f}% | Universe: {len(config.symbols)}",
-        f"Daily halt: {'ON' if daily.get('halt', False) else 'off'} | Weekly halt: {'ON' if state.get('weekly', {}).get('halt', False) else 'off'} | Open order symbols: {', '.join(sorted(open_order_symbols)) if open_order_symbols else 'none'}",
+        f"Daily halt: {'ON' if daily.get('halt', False) else 'off'} | Weekly halt: {'ON' if state.get('weekly', {}).get('halt', False) else 'off'} | Strategy halt: {'ON' if state.get('meta', {}).get('strategy_halt', False) else 'off'} | Open order symbols: {', '.join(sorted(open_order_symbols)) if open_order_symbols else 'none'}",
         f"Portfolio heat: {safe_float(state.get('meta', {}).get('portfolio_heat')):.2%} | Loss streak: {int(state.get('meta', {}).get('consecutive_losses', 0))} | Candidates: {int(state.get('meta', {}).get('candidate_count', 0))}",
     ]
     cross_asset = state.get("meta", {}).get("cross_asset", {})
@@ -944,6 +950,10 @@ def get_sym_state(state: Dict[str, Any], symbol: str) -> Dict[str, Any]:
             "order_block_until_ts": None,
             "order_fail_count": 0,
             "last_order_error": None,
+            "last_exit_reason": None,
+            "last_exit_ts": None,
+            "last_entry_source_closed": None,
+            "reentry_count": 0,
             "tp1_hit": False,
             "warm_ltf_ok": False,
             "warm_htf_ok": False,
@@ -987,6 +997,39 @@ def record_order_failure(config: BotConfig, sym_state: Dict[str, Any], message: 
     sym_state["order_fail_count"] = int(sym_state.get("order_fail_count", 0)) + 1
     sym_state["last_order_error"] = message
     sym_state["order_block_until_ts"] = now_utc().timestamp() + config.failed_order_cooldown_secs
+
+
+def clear_reentry_state(sym_state: Dict[str, Any]) -> None:
+    sym_state["last_exit_reason"] = None
+    sym_state["last_exit_ts"] = None
+    sym_state["last_entry_source_closed"] = None
+    sym_state["reentry_count"] = 0
+
+
+def record_exit_reason(sym_state: Dict[str, Any], reason: str) -> None:
+    sym_state["last_exit_reason"] = reason
+    sym_state["last_exit_ts"] = now_utc().timestamp()
+    sym_state["last_entry_source_closed"] = sym_state.get("entry_source")
+    if reason == "stop":
+        sym_state["reentry_count"] = int(sym_state.get("reentry_count", 0)) + 1
+    else:
+        sym_state["reentry_count"] = 0
+
+
+def eligible_reentry(config: BotConfig, sym_state: Dict[str, Any], signal: Optional[EntrySignal]) -> bool:
+    if signal is None:
+        return False
+    if sym_state.get("last_exit_reason") != "stop":
+        return False
+    exit_ts = sym_state.get("last_exit_ts")
+    if exit_ts is None:
+        return False
+    if (now_utc().timestamp() - float(exit_ts)) > config.reentry_window_secs:
+        return False
+    if int(sym_state.get("reentry_count", 0)) > config.max_reentries_per_symbol:
+        return False
+    previous_source = sym_state.get("last_entry_source_closed")
+    return previous_source == signal.source
 
 
 def total_notional(positions: Dict[str, BrokerPosition], prices: Dict[str, float]) -> float:
@@ -1363,6 +1406,8 @@ def build_runtime_alerts(config: BotConfig, state: Dict[str, Any], report: Dict[
     ]
     if failed_symbols:
         alerts.append(f"Recent order failures: {', '.join(sorted(failed_symbols)[:3])}.")
+    if meta.get("strategy_halt", False):
+        alerts.append("Strategy kill switch is active.")
 
     health = report.get("health", {})
     if health.get("status") == "degraded":
@@ -1370,6 +1415,21 @@ def build_runtime_alerts(config: BotConfig, state: Dict[str, Any], report: Dict[
     elif health.get("status") == "watch":
         alerts.append("Research health is on watch.")
     return alerts[:6]
+
+
+def update_strategy_health_halt(config: BotConfig, state: Dict[str, Any], report: Dict[str, Any]) -> None:
+    meta = state.setdefault("meta", {})
+    if not config.strategy_kill_switch_enabled:
+        meta["strategy_halt"] = False
+        meta["disabled_sources"] = []
+        return
+    health = report.get("health", {})
+    if report.get("closed_trades", 0) >= 8 and health.get("status") == "degraded":
+        meta["strategy_halt"] = True
+        meta["disabled_sources"] = list(health.get("weak_sources", []))
+        return
+    meta["strategy_halt"] = False
+    meta["disabled_sources"] = list(health.get("weak_sources", [])) if health.get("status") == "watch" else []
 
 
 def build_research_report(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1846,6 +1906,8 @@ def can_open_new_risk(config: BotConfig, state: Dict[str, Any]) -> bool:
         return False
     if state.get("weekly", {}).get("halt", False):
         return False
+    if state.get("meta", {}).get("strategy_halt", False):
+        return False
     if int(state.get("meta", {}).get("consecutive_losses", 0)) >= config.max_consecutive_losses:
         return False
     return True
@@ -2006,6 +2068,7 @@ def execute_ranked_entries(
         sym_state["entry_source"] = candidate.signal.source
         sym_state["entry_regime"] = candidate.regime.name
         sym_state["live_stop"] = candidate.signal.stop
+        clear_reentry_state(sym_state)
         set_fired(sym_state)
         entries_taken += 1
         allocated += submitted_qty * candidate.signal.breakout_level
@@ -2293,14 +2356,17 @@ def process_symbol(
             reverse=True,
         )
         entry_signal = ranked_setups[0] if ranked_setups else None
+        fire_ready = can_fire(config, sym_state) or eligible_reentry(config, sym_state, entry_signal)
+        disabled_sources = set(state.get("meta", {}).get("disabled_sources", []))
 
         candidate: Optional[CandidateSetup] = None
         if (
             entry_signal
-            and can_fire(config, sym_state)
+            and fire_ready
             and (trend_ok or entry_signal.source in {"sentiment", "reversal", "news_momentum"})
             and rel_strength >= config.min_relative_strength
             and execution_quality >= config.min_execution_quality
+            and entry_signal.source not in disabled_sources
         ):
             candidate_score = score_setup(
                 entry_signal,
@@ -2327,6 +2393,8 @@ def process_symbol(
             )
             set_snapshot_candidate_score(state, symbol, candidate_score)
             action_label = f"candidate {entry_signal.source}"
+            if eligible_reentry(config, sym_state, entry_signal):
+                action_label = f"reentry {entry_signal.source}"
             write_signal_journal(
                 config,
                 symbol,
@@ -2375,6 +2443,7 @@ def process_symbol(
             action_label = "exit failed"
             log_line(config, f"{symbol} bearish sentiment exit failed: {error_message}")
         else:
+            record_exit_reason(sym_state, "sentiment")
             set_fired(sym_state)
             action_label = "sell sentiment"
             pnl_value = (last - position.avg_entry_price) * submitted_qty
@@ -2422,6 +2491,7 @@ def process_symbol(
             action_label = "tp2 failed"
             log_line(config, f"{symbol} TP2 failed: {error_message}")
         else:
+            record_exit_reason(sym_state, "tp2")
             set_fired(sym_state)
             action_label = "take profit 2"
             pnl_value = (last - position.avg_entry_price) * submitted_qty
@@ -2447,6 +2517,7 @@ def process_symbol(
             action_label = "stop failed"
             log_line(config, f"{symbol} stop exit failed: {error_message}")
         else:
+            record_exit_reason(sym_state, "stop")
             set_fired(sym_state)
             action_label = "stop exit"
             pnl_value = (last - position.avg_entry_price) * submitted_qty
@@ -2577,6 +2648,7 @@ def run_once(
     meta["portfolio_heat"] = portfolio_heat(positions, state, prices_now, max(account.equity, 1e-9))
     meta["sector_exposure"] = sector_exposure(positions, prices_now, max(account.equity, 1e-9))
     report = build_research_report(state)
+    update_strategy_health_halt(config, state, report)
     meta["alerts"] = build_runtime_alerts(config, state, report)
     config.research_report.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print_dashboard(config, state, positions, open_order_symbols)

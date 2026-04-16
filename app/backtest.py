@@ -54,6 +54,9 @@ class BacktestConfig:
     failed_order_cooldown_secs: int = 300
     max_order_retries: int = 1
     thin_liquidity_size_penalty: float = 0.86
+    reentry_window_secs: int = 1800
+    max_reentries_per_symbol: int = 1
+    strategy_kill_switch_enabled: bool = True
 
     @property
     def warmup_ltf(self) -> int:
@@ -143,6 +146,9 @@ def as_runtime_config(config: BacktestConfig) -> Any:
         failed_order_cooldown_secs=config.failed_order_cooldown_secs,
         max_order_retries=config.max_order_retries,
         thin_liquidity_size_penalty=config.thin_liquidity_size_penalty,
+        reentry_window_secs=config.reentry_window_secs,
+        max_reentries_per_symbol=config.max_reentries_per_symbol,
+        strategy_kill_switch_enabled=config.strategy_kill_switch_enabled,
     )
 
 
@@ -203,6 +209,9 @@ def portfolio_runtime_config(config: BacktestConfig) -> Any:
     runtime.failed_order_cooldown_secs = config.failed_order_cooldown_secs
     runtime.max_order_retries = config.max_order_retries
     runtime.thin_liquidity_size_penalty = config.thin_liquidity_size_penalty
+    runtime.reentry_window_secs = config.reentry_window_secs
+    runtime.max_reentries_per_symbol = config.max_reentries_per_symbol
+    runtime.strategy_kill_switch_enabled = config.strategy_kill_switch_enabled
     return runtime
 
 

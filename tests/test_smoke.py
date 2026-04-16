@@ -96,6 +96,9 @@ def make_config(case_name: str) -> crypto_trader.BotConfig:
         failed_order_cooldown_secs=300,
         max_order_retries=1,
         thin_liquidity_size_penalty=0.86,
+        reentry_window_secs=1800,
+        max_reentries_per_symbol=1,
+        strategy_kill_switch_enabled=True,
     )
 
 
@@ -180,6 +183,30 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertIn("temporary venue issue", error)
         self.assertGreater(sym_state["order_fail_count"], 0)
         self.assertIsNotNone(sym_state["order_block_until_ts"])
+
+    def test_eligible_reentry_after_stop_for_same_source(self):
+        config = make_config("reentry")
+        sym_state = crypto_trader.get_sym_state(crypto_trader.default_state(100000.0), "BTC/USD")
+        sym_state["last_exit_reason"] = "stop"
+        sym_state["last_exit_ts"] = crypto_trader.now_utc().timestamp()
+        sym_state["last_entry_source_closed"] = "technical"
+        sym_state["reentry_count"] = 1
+        signal = crypto_trader.EntrySignal(
+            breakout_level=100.0,
+            stop=95.0,
+            tp1=103.0,
+            tp2=106.0,
+            trail_anchor=96.0,
+            atr_value=2.0,
+            volume_ratio=1.2,
+            rsi_value=60.0,
+            source="technical",
+            confidence=0.9,
+            atr_pct=0.02,
+            ema_spread_pct=0.01,
+            reason="breakout",
+        )
+        self.assertTrue(crypto_trader.eligible_reentry(config, sym_state, signal))
 
     def test_compute_cross_asset_context_detects_risk_on(self):
         config = make_config("cross_asset")
@@ -352,6 +379,14 @@ class StrategySmokeTests(unittest.TestCase):
         alerts = crypto_trader.build_runtime_alerts(config, state, report)
         self.assertTrue(any("Daily drawdown halt" in item for item in alerts))
         self.assertTrue(any("risk-off" in item for item in alerts))
+
+    def test_strategy_kill_switch_sets_halt_when_health_is_degraded(self):
+        config = make_config("strategy_halt")
+        state = crypto_trader.default_state(100000.0)
+        report = {"closed_trades": 9, "health": {"status": "degraded", "weak_sources": ["technical"]}}
+        crypto_trader.update_strategy_health_halt(config, state, report)
+        self.assertTrue(state["meta"]["strategy_halt"])
+        self.assertIn("technical", state["meta"]["disabled_sources"])
 
     def test_execute_ranked_entries_respects_ranking_and_updates_state(self):
         config = make_config("execute_ranked")
