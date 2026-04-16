@@ -556,6 +556,13 @@ def print_dashboard(
     if theme_exposure_map:
         top_theme = max(theme_exposure_map.items(), key=lambda item: item[1])
         lines.append(f"Theme concentration: {top_theme[0]} {safe_float(top_theme[1]):.2%}")
+    live_summary = state.get("meta", {}).get("live_artifacts", {})
+    if live_summary:
+        lines.append(
+            f"Live flow: accepted={int(live_summary.get('recent_accepted_signals', 0))} "
+            f"rejected={int(live_summary.get('recent_rejected_signals', 0))} "
+            f"entries={int(live_summary.get('recent_entries', 0))} exits={int(live_summary.get('recent_exits', 0))}"
+        )
     cross_asset = state.get("meta", {}).get("cross_asset", {})
     if cross_asset:
         lines.append(
@@ -1445,6 +1452,63 @@ def summarize_feature(records: List[Dict[str, Any]], field: str) -> Dict[str, Di
     return {key: summarize_bucket(items) for key, items in buckets.items()}
 
 
+def _read_csv_rows(path: pathlib.Path) -> List[Dict[str, str]]:
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", newline="", encoding="utf-8") as file_obj:
+            return list(csv.DictReader(file_obj))
+    except Exception:
+        return []
+
+
+def build_live_artifact_summary(config: BotConfig) -> Dict[str, Any]:
+    trades = _read_csv_rows(config.trades_csv)
+    signals = _read_csv_rows(config.signals_csv)
+    recent_trades = trades[-30:]
+    recent_signals = signals[-60:]
+    entry_actions = [row for row in recent_trades if row.get("action") == "ENTRY_SUBMITTED"]
+    exit_actions = [row for row in recent_trades if str(row.get("action", "")).startswith("EXIT_") or row.get("action") == "TP1_SUBMITTED"]
+    accepted_signals = [row for row in recent_signals if row.get("action") == "accepted"]
+    rejected_signals = [row for row in recent_signals if row.get("action") == "rejected"]
+
+    top_rejections: Dict[str, int] = {}
+    accepted_by_setup: Dict[str, int] = {}
+    for row in rejected_signals:
+        reason = row.get("reason", "unknown")
+        top_rejections[reason] = top_rejections.get(reason, 0) + 1
+    for row in accepted_signals:
+        setup = row.get("setup", "unknown")
+        accepted_by_setup[setup] = accepted_by_setup.get(setup, 0) + 1
+
+    return {
+        "recent_entries": len(entry_actions),
+        "recent_exits": len(exit_actions),
+        "recent_accepted_signals": len(accepted_signals),
+        "recent_rejected_signals": len(rejected_signals),
+        "top_rejection_reasons": sorted(top_rejections.items(), key=lambda item: item[1], reverse=True)[:3],
+        "accepted_by_setup": accepted_by_setup,
+    }
+
+
+def apply_live_source_tuning(state: Dict[str, Any], report: Dict[str, Any], artifact_summary: Dict[str, Any]) -> None:
+    meta = state.setdefault("meta", {})
+    disabled_sources = set(meta.get("disabled_sources", []))
+    source_health = report.get("by_source", {})
+    for source, bucket in source_health.items():
+        if int(bucket.get("count", 0)) >= 4 and safe_float(bucket.get("expectancy")) < 0:
+            disabled_sources.add(source)
+    accepted_by_setup = artifact_summary.get("accepted_by_setup", {})
+    if sum(accepted_by_setup.values()) >= 6:
+        inactive_sources = [source for source in source_health if accepted_by_setup.get(source, 0) == 0]
+        for source in inactive_sources:
+            if source in disabled_sources:
+                continue
+            if safe_float(source_health.get(source, {}).get("expectancy")) < 0:
+                disabled_sources.add(source)
+    meta["disabled_sources"] = sorted(disabled_sources)
+
+
 def build_parameter_health(
     summary: Dict[str, float],
     by_source: Dict[str, Dict[str, float]],
@@ -1514,6 +1578,11 @@ def build_runtime_alerts(config: BotConfig, state: Dict[str, Any], report: Dict[
         alerts.append("Strategy kill switch is active.")
     for alert in meta.get("behavior_alerts", [])[:3]:
         alerts.append(alert)
+    live_summary = meta.get("live_artifacts", {})
+    top_rejections = live_summary.get("top_rejection_reasons", [])
+    if top_rejections:
+        reason, count = top_rejections[0]
+        alerts.append(f"Top live rejection: {reason} ({count}).")
 
     health = report.get("health", {})
     if health.get("status") == "degraded":
@@ -2842,6 +2911,8 @@ def run_once(
     meta["theme_exposure"] = theme_exposure(positions, prices_now, max(account.equity, 1e-9))
     report = build_research_report(state)
     update_strategy_health_halt(config, state, report)
+    meta["live_artifacts"] = build_live_artifact_summary(config)
+    apply_live_source_tuning(state, report, meta["live_artifacts"])
     previous_behavior = meta.get("last_behavior_snapshot")
     current_behavior = build_behavior_snapshot(state)
     meta["behavior_alerts"] = detect_behavior_shift_alerts(previous_behavior, current_behavior)

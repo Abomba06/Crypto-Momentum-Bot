@@ -395,6 +395,23 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertTrue(any("Daily drawdown halt" in item for item in alerts))
         self.assertTrue(any("risk-off" in item for item in alerts))
 
+    def test_build_live_artifact_summary_reads_recent_signal_and_trade_flow(self):
+        config = make_config("live_artifacts")
+        crypto_trader.write_signal_journal(config, "BTC/USD", "technical", "trend", 1.2, 0.2, 2.0, "accepted", "breakout")
+        crypto_trader.write_signal_journal(config, "ETH/USD", "pullback", "trend", 1.0, 0.1, 1.5, "rejected", "theme_exposure")
+        crypto_trader.write_trade(config, "BTC/USD", "ENTRY_SUBMITTED", 100.0, 100.0, 95.0, 103.0, 106.0, 1.0, "note")
+        summary = crypto_trader.build_live_artifact_summary(config)
+        self.assertEqual(summary["recent_entries"], 1)
+        self.assertEqual(summary["recent_accepted_signals"], 1)
+        self.assertEqual(summary["top_rejection_reasons"][0][0], "theme_exposure")
+
+    def test_apply_live_source_tuning_disables_negative_source(self):
+        state = crypto_trader.default_state(100000.0)
+        report = {"by_source": {"technical": {"count": 5, "expectancy": -10.0}, "pullback": {"count": 5, "expectancy": 4.0}}}
+        artifacts = {"accepted_by_setup": {"technical": 0, "pullback": 4}}
+        crypto_trader.apply_live_source_tuning(state, report, artifacts)
+        self.assertIn("technical", state["meta"]["disabled_sources"])
+
     def test_detect_behavior_shift_alerts_flags_major_changes(self):
         previous = {"candidate_count": 4, "cross_asset_regime": "risk-on", "top_setup": "technical", "strategy_halt": False}
         current = {"candidate_count": 0, "cross_asset_regime": "risk-off", "top_setup": "news_momentum", "strategy_halt": True}
