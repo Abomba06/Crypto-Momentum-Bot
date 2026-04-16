@@ -353,6 +353,36 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertIn("summary", result)
         self.assertGreaterEqual(len(result["windows"]), 1)
 
+    def test_portfolio_backtest_returns_multi_symbol_metrics(self):
+        idx = pd.date_range("2024-01-01", periods=320, freq="D")
+        df_a = pd.DataFrame(
+            {
+                "open": [100 + ((i % 5) * 0.10) + i * 0.06 for i in range(len(idx))],
+                "high": [101 + ((i % 5) * 0.10) + i * 0.06 for i in range(len(idx))],
+                "low": [99 + ((i % 5) * 0.10) + i * 0.06 for i in range(len(idx))],
+                "close": [100 + ((i % 5) * 0.10) + i * 0.06 for i in range(len(idx))],
+                "volume": [1000 + (i % 7) * 30 for i in range(len(idx))],
+            },
+            index=idx,
+        )
+        df_b = pd.DataFrame(
+            {
+                "open": [80 + ((i % 4) * 0.12) + i * 0.05 for i in range(len(idx))],
+                "high": [81 + ((i % 4) * 0.12) + i * 0.05 for i in range(len(idx))],
+                "low": [79 + ((i % 4) * 0.12) + i * 0.05 for i in range(len(idx))],
+                "close": [80 + ((i % 4) * 0.12) + i * 0.05 for i in range(len(idx))],
+                "volume": [900 + (i % 5) * 35 for i in range(len(idx))],
+            },
+            index=idx,
+        )
+        result = backtest.simulate_portfolio_strategy(
+            {"AAA": df_a, "BBB": df_b},
+            backtest.BacktestConfig(symbols=["AAA", "BBB"], max_entries_per_bar=2),
+        )
+        self.assertIn("metrics", result)
+        self.assertEqual(sorted(result["metrics"]["symbols"]), ["AAA", "BBB"])
+        self.assertGreater(len(result["equity_curve"]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

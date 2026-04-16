@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
@@ -11,6 +11,7 @@ from app import crypto_trader
 @dataclass(frozen=True)
 class BacktestConfig:
     symbol: str = "SPY"
+    symbols: List[str] = field(default_factory=list)
     start: str = "2018-01-01"
     interval: str = "1d"
     cash: float = 100_000.0
@@ -43,6 +44,7 @@ class BacktestConfig:
     ema_slope_lookback: int = 3
     pullback_ema_buffer_atr: float = 0.35
     trend_mode: str = "loose"
+    max_entries_per_bar: int = 2
 
     @property
     def warmup_ltf(self) -> int:
@@ -83,6 +85,10 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 def load_price_history(symbol: str, start: str, interval: str = "1d") -> pd.DataFrame:
     df = yf.download(symbol, start=start, interval=interval, auto_adjust=True, progress=False)
     return normalize_ohlcv(df)
+
+
+def load_price_histories(symbols: List[str], start: str, interval: str = "1d") -> Dict[str, pd.DataFrame]:
+    return {symbol: load_price_history(symbol, start, interval) for symbol in symbols}
 
 
 def as_runtime_config(config: BacktestConfig) -> Any:
@@ -153,6 +159,14 @@ def compute_metrics(equity_curve: List[float], trades: List[Dict[str, Any]], sta
         "win_rate": win_rate,
         "avg_trade_pct": avg_trade_pct,
     }
+
+
+def portfolio_runtime_config(config: BacktestConfig) -> Any:
+    runtime = as_runtime_config(config)
+    runtime.max_entries_per_loop = config.max_entries_per_bar
+    runtime.max_portfolio_heat = config.portfolio_cap
+    runtime.max_sector_exposure = 1.0
+    return runtime
 
 
 def simulate_strategy(df: pd.DataFrame, config: Optional[BacktestConfig] = None) -> Dict[str, Any]:
@@ -309,6 +323,185 @@ def simulate_strategy(df: pd.DataFrame, config: Optional[BacktestConfig] = None)
         equity_curve.append(cash + (qty * last))
 
     metrics = compute_metrics(equity_curve, trade_log, config.cash)
+    return {"metrics": metrics, "equity_curve": equity_curve, "trades": trade_log}
+
+
+def aligned_history(data_map: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    normalized = {symbol: normalize_ohlcv(df).copy() for symbol, df in data_map.items()}
+    common_index = None
+    for df in normalized.values():
+        common_index = df.index if common_index is None else common_index.intersection(df.index)
+    if common_index is None or len(common_index) == 0:
+        raise ValueError("No overlapping history across symbols")
+    return {symbol: df.loc[common_index].copy() for symbol, df in normalized.items()}
+
+
+def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optional[BacktestConfig] = None) -> Dict[str, Any]:
+    config = config or BacktestConfig()
+    runtime = portfolio_runtime_config(config)
+    histories = aligned_history(data_map)
+    symbols = list(histories.keys())
+    index = list(next(iter(histories.values())).index)
+    closes = {symbol: histories[symbol]["close"].tolist() for symbol in symbols}
+    highs = {symbol: histories[symbol]["high"].tolist() for symbol in symbols}
+    lows = {symbol: histories[symbol]["low"].tolist() for symbol in symbols}
+    volumes = {symbol: histories[symbol]["volume"].tolist() for symbol in symbols}
+
+    cash = config.cash
+    positions: Dict[str, Dict[str, Any]] = {}
+    state = crypto_trader.default_state(config.cash)
+    equity_curve: List[float] = []
+    trade_log: List[Dict[str, Any]] = []
+    start_idx = max(runtime.warmup_ltf, runtime.warmup_htf)
+
+    for idx in range(start_idx, len(index)):
+        prices_now = {symbol: closes[symbol][idx] for symbol in symbols}
+
+        for symbol in list(positions.keys()):
+            window_closes = closes[symbol][: idx + 1]
+            window_highs = highs[symbol][: idx + 1]
+            window_lows = lows[symbol][: idx + 1]
+            position_data = positions[symbol]
+            sym_state = crypto_trader.get_sym_state(state, symbol)
+            broker_position = crypto_trader.BrokerPosition(
+                symbol=symbol,
+                qty=position_data["qty"],
+                qty_available=position_data["qty"],
+                avg_entry_price=position_data["entry_price"],
+                current_price=prices_now[symbol],
+                market_value=position_data["qty"] * prices_now[symbol],
+            )
+            stop, tp1, tp2 = crypto_trader.compute_live_exit_levels(runtime, broker_position, sym_state, window_closes, window_highs, window_lows)
+            sym_state["live_stop"] = stop
+            prev_price = sym_state.get("prev_price")
+            last = prices_now[symbol]
+            if crypto_trader.crossed_up(prev_price, last, tp2) or crypto_trader.crossed_down(prev_price, last, stop):
+                reason = "tp2" if crypto_trader.crossed_up(prev_price, last, tp2) else "stop"
+                exit_level = tp2 if reason == "tp2" else stop
+                exit_price = cost_adjusted_price(exit_level, config.fee_bps, config.slippage_bps, "sell")
+                qty = position_data["qty"]
+                cash += qty * exit_price
+                trade_log.append(
+                    {
+                        "entry_ts": position_data["entry_ts"],
+                        "exit_ts": str(index[idx]),
+                        "symbol": symbol,
+                        "entry_price": position_data["entry_price"],
+                        "exit_price": exit_price,
+                        "qty": qty,
+                        "source": position_data["source"],
+                        "regime": position_data["regime"],
+                        "pnl_value": (exit_price - position_data["entry_price"]) * qty,
+                        "pnl_pct": ((exit_price / max(position_data["entry_price"], 1e-9)) - 1.0) * 100.0,
+                        "exit_reason": reason,
+                    }
+                )
+                del positions[symbol]
+                crypto_trader.reset_trade_state(sym_state)
+            elif not sym_state.get("tp1_hit", False) and crypto_trader.crossed_up(prev_price, last, tp1):
+                partial_qty = position_data["qty"] * 0.4
+                fill_price = cost_adjusted_price(tp1, config.fee_bps, config.slippage_bps, "sell")
+                cash += partial_qty * fill_price
+                position_data["qty"] -= partial_qty
+                sym_state["tp1_hit"] = True
+                trade_log.append(
+                    {
+                        "entry_ts": position_data["entry_ts"],
+                        "exit_ts": str(index[idx]),
+                        "symbol": symbol,
+                        "entry_price": position_data["entry_price"],
+                        "exit_price": fill_price,
+                        "qty": partial_qty,
+                        "source": position_data["source"],
+                        "regime": position_data["regime"],
+                        "pnl_value": (fill_price - position_data["entry_price"]) * partial_qty,
+                        "pnl_pct": ((fill_price / max(position_data["entry_price"], 1e-9)) - 1.0) * 100.0,
+                        "exit_reason": "tp1",
+                    }
+                )
+            sym_state["prev_price"] = last
+
+        candidates: List[crypto_trader.CandidateSetup] = []
+        allocated_now = sum(pos["qty"] * prices_now[symbol] for symbol, pos in positions.items())
+        account_equity = cash + sum(pos["qty"] * prices_now[symbol] for symbol, pos in positions.items())
+        for symbol in symbols:
+            if symbol in positions:
+                continue
+            window_closes = closes[symbol][: idx + 1]
+            window_highs = highs[symbol][: idx + 1]
+            window_lows = lows[symbol][: idx + 1]
+            window_volumes = volumes[symbol][: idx + 1]
+            htf_closes = window_closes[-max(runtime.warmup_htf, runtime.htf_slow + runtime.htf_slope_n + 5) :]
+            if len(htf_closes) < max(runtime.htf_slow + runtime.htf_slope_n, runtime.warmup_htf):
+                continue
+            trend_ok, htf_fast, htf_slow, htf_slope = crypto_trader.compute_trend_ok(runtime, htf_closes)
+            trend_value = crypto_trader.trend_score(htf_fast, htf_slow, htf_slope, htf_closes[-1])
+            atr_live = crypto_trader.atr(window_highs, window_lows, window_closes, runtime.atr_len)
+            atr_pct_live = atr_live / max(window_closes[-1], 1e-9) if atr_live and atr_live == atr_live else 0.0
+            vol_ratio_live = crypto_trader.volume_ratio(window_volumes, runtime.volume_window)
+            regime = crypto_trader.detect_regime(trend_ok, trend_value, atr_pct_live, vol_ratio_live, None)
+            setup_options = []
+            breakout_signal = crypto_trader.build_entry_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
+            pullback_signal = crypto_trader.build_pullback_entry_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
+            if breakout_signal and regime.allow_breakout:
+                setup_options.append(breakout_signal)
+            if pullback_signal and regime.allow_pullback:
+                setup_options.append(pullback_signal)
+            if not setup_options:
+                continue
+            signal = sorted(
+                setup_options,
+                key=lambda item: crypto_trader.score_setup(item, trend_value, None, regime),
+                reverse=True,
+            )[0]
+            candidates.append(
+                crypto_trader.CandidateSetup(
+                    symbol=symbol,
+                    signal=signal,
+                    regime=regime,
+                    sentiment=None,
+                    trend_score=trend_value,
+                    sector=crypto_trader.sector_for_symbol(symbol),
+                    score=crypto_trader.score_setup(signal, trend_value, None, regime),
+                    last_price=window_closes[-1],
+                )
+            )
+
+        for candidate in sorted(candidates, key=lambda item: item.score, reverse=True)[: config.max_entries_per_bar]:
+            qty_size = crypto_trader.size_for_risk(
+                runtime,
+                cash,
+                candidate.signal.breakout_level,
+                candidate.signal.stop,
+                account_equity,
+                allocated_now,
+            )
+            qty_size *= candidate.signal.confidence * candidate.regime.risk_multiplier
+            fill_price = cost_adjusted_price(candidate.signal.breakout_level, config.fee_bps, config.slippage_bps, "buy")
+            notional = qty_size * fill_price
+            if qty_size <= 0 or notional > cash:
+                continue
+            positions[candidate.symbol] = {
+                "qty": qty_size,
+                "entry_price": fill_price,
+                "entry_ts": str(index[idx]),
+                "source": candidate.signal.source,
+                "regime": candidate.regime.name,
+            }
+            sym_state = crypto_trader.get_sym_state(state, candidate.symbol)
+            sym_state["tp1_hit"] = False
+            sym_state["high_water"] = candidate.last_price
+            sym_state["last_entry_price"] = fill_price
+            sym_state["entry_source"] = candidate.signal.source
+            sym_state["entry_regime"] = candidate.regime.name
+            cash -= notional
+            allocated_now += notional
+
+        equity_curve.append(cash + sum(pos["qty"] * prices_now[symbol] for symbol, pos in positions.items()))
+
+    metrics = compute_metrics(equity_curve, trade_log, config.cash)
+    metrics["symbols"] = symbols
+    metrics["open_positions"] = len(positions)
     return {"metrics": metrics, "equity_curve": equity_curve, "trades": trade_log}
 
 
