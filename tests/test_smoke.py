@@ -395,6 +395,14 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertTrue(any("Daily drawdown halt" in item for item in alerts))
         self.assertTrue(any("risk-off" in item for item in alerts))
 
+    def test_detect_behavior_shift_alerts_flags_major_changes(self):
+        previous = {"candidate_count": 4, "cross_asset_regime": "risk-on", "top_setup": "technical", "strategy_halt": False}
+        current = {"candidate_count": 0, "cross_asset_regime": "risk-off", "top_setup": "news_momentum", "strategy_halt": True}
+        alerts = crypto_trader.detect_behavior_shift_alerts(previous, current)
+        self.assertTrue(any("collapsed" in item for item in alerts))
+        self.assertTrue(any("regime changed" in item for item in alerts))
+        self.assertTrue(any("halt" in item for item in alerts))
+
     def test_strategy_kill_switch_sets_halt_when_health_is_degraded(self):
         config = make_config("strategy_halt")
         state = crypto_trader.default_state(100000.0)
@@ -525,6 +533,7 @@ class StrategySmokeTests(unittest.TestCase):
         result = backtest.walk_forward_validate(df, backtest.BacktestConfig(train_bars=200, test_bars=100))
         self.assertIn("summary", result)
         self.assertGreaterEqual(len(result["windows"]), 1)
+        self.assertIn("stability_score", result["summary"])
 
     def test_portfolio_backtest_returns_multi_symbol_metrics(self):
         idx = pd.date_range("2024-01-01", periods=320, freq="D")
@@ -577,6 +586,8 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertEqual(result["evaluated"], 4)
         self.assertIsNotNone(result["best"])
         self.assertGreaterEqual(len(result["top"]), 1)
+        self.assertIn("walk_forward", result["best"])
+        self.assertIn("robustness", result["best"])
 
 
 if __name__ == "__main__":

@@ -1512,6 +1512,8 @@ def build_runtime_alerts(config: BotConfig, state: Dict[str, Any], report: Dict[
         alerts.append(f"Recent order failures: {', '.join(sorted(failed_symbols)[:3])}.")
     if meta.get("strategy_halt", False):
         alerts.append("Strategy kill switch is active.")
+    for alert in meta.get("behavior_alerts", [])[:3]:
+        alerts.append(alert)
 
     health = report.get("health", {})
     if health.get("status") == "degraded":
@@ -1519,6 +1521,44 @@ def build_runtime_alerts(config: BotConfig, state: Dict[str, Any], report: Dict[
     elif health.get("status") == "watch":
         alerts.append("Research health is on watch.")
     return alerts[:6]
+
+
+def build_behavior_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+    meta = state.get("meta", {})
+    top_candidates = meta.get("top_candidates", [])
+    top_setup = top_candidates[0].get("setup") if top_candidates else None
+    return {
+        "candidate_count": int(meta.get("candidate_count", 0)),
+        "cross_asset_regime": meta.get("cross_asset", {}).get("regime", "neutral"),
+        "top_setup": top_setup,
+        "strategy_halt": bool(meta.get("strategy_halt", False)),
+    }
+
+
+def detect_behavior_shift_alerts(previous: Optional[Dict[str, Any]], current: Dict[str, Any]) -> List[str]:
+    if not previous:
+        return []
+    alerts: List[str] = []
+    prev_candidates = int(previous.get("candidate_count", 0))
+    curr_candidates = int(current.get("candidate_count", 0))
+    if prev_candidates >= 3 and curr_candidates == 0:
+        alerts.append("Candidate flow collapsed from active to zero.")
+    elif prev_candidates == 0 and curr_candidates >= 3:
+        alerts.append("Candidate flow reactivated sharply.")
+
+    prev_regime = previous.get("cross_asset_regime")
+    curr_regime = current.get("cross_asset_regime")
+    if prev_regime != curr_regime:
+        alerts.append(f"Cross-asset regime changed: {prev_regime} -> {curr_regime}.")
+
+    prev_setup = previous.get("top_setup")
+    curr_setup = current.get("top_setup")
+    if prev_setup and curr_setup and prev_setup != curr_setup:
+        alerts.append(f"Lead setup changed: {prev_setup} -> {curr_setup}.")
+
+    if not bool(previous.get("strategy_halt", False)) and bool(current.get("strategy_halt", False)):
+        alerts.append("Strategy halt just activated.")
+    return alerts[:4]
 
 
 def trade_metadata_from_state(sym_state: Dict[str, Any]) -> Dict[str, Any]:
@@ -2802,6 +2842,10 @@ def run_once(
     meta["theme_exposure"] = theme_exposure(positions, prices_now, max(account.equity, 1e-9))
     report = build_research_report(state)
     update_strategy_health_halt(config, state, report)
+    previous_behavior = meta.get("last_behavior_snapshot")
+    current_behavior = build_behavior_snapshot(state)
+    meta["behavior_alerts"] = detect_behavior_shift_alerts(previous_behavior, current_behavior)
+    meta["last_behavior_snapshot"] = current_behavior
     meta["alerts"] = build_runtime_alerts(config, state, report)
     config.research_report.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print_dashboard(config, state, positions, open_order_symbols)

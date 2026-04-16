@@ -613,7 +613,19 @@ def walk_forward_validate(df: pd.DataFrame, config: Optional[BacktestConfig] = N
     data = normalize_ohlcv(df)
     if len(data) < config.train_bars + config.test_bars:
         result = simulate_strategy(data, config)
-        return {"windows": [result["metrics"]], "summary": result["metrics"]}
+        summary = dict(result["metrics"])
+        summary["windows"] = 1
+        summary["avg_return_pct"] = result["metrics"]["total_return_pct"]
+        summary["avg_max_drawdown_pct"] = result["metrics"]["max_drawdown_pct"]
+        summary["avg_win_rate"] = result["metrics"]["win_rate"]
+        summary["positive_window_ratio"] = 1.0 if result["metrics"]["total_return_pct"] > 0 else 0.0
+        summary["worst_window_return_pct"] = result["metrics"]["total_return_pct"]
+        summary["stability_score"] = (
+            result["metrics"]["total_return_pct"]
+            - (0.5 * result["metrics"]["max_drawdown_pct"])
+            + (10.0 * summary["positive_window_ratio"])
+        )
+        return {"windows": [result["metrics"]], "summary": summary}
 
     windows: List[Dict[str, Any]] = []
     start = 0
@@ -632,6 +644,13 @@ def walk_forward_validate(df: pd.DataFrame, config: Optional[BacktestConfig] = N
         "avg_return_pct": sum(item["total_return_pct"] for item in windows) / max(len(windows), 1),
         "avg_max_drawdown_pct": sum(item["max_drawdown_pct"] for item in windows) / max(len(windows), 1),
         "avg_win_rate": sum(item["win_rate"] for item in windows) / max(len(windows), 1),
+        "positive_window_ratio": sum(1 for item in windows if item["total_return_pct"] > 0) / max(len(windows), 1),
+        "worst_window_return_pct": min((item["total_return_pct"] for item in windows), default=0.0),
+        "stability_score": (
+            (sum(item["total_return_pct"] for item in windows) / max(len(windows), 1))
+            - (0.5 * (sum(item["max_drawdown_pct"] for item in windows) / max(len(windows), 1)))
+            + (10.0 * (sum(1 for item in windows if item["total_return_pct"] > 0) / max(len(windows), 1)))
+        ),
     }
     return {"windows": windows, "summary": summary}
 
@@ -655,14 +674,18 @@ def parameter_sweep(
         result = simulate_strategy(df, config)
         metrics = dict(result["metrics"])
         score = metrics["total_return_pct"] - (0.5 * metrics["max_drawdown_pct"])
+        walk_forward = walk_forward_validate(df, config)
+        robustness = walk_forward["summary"]["stability_score"]
         variants.append(
             {
                 "params": params,
                 "metrics": metrics,
+                "walk_forward": walk_forward["summary"],
                 "score": score,
+                "robustness": robustness,
             }
         )
-    variants.sort(key=lambda item: item["score"], reverse=True)
+    variants.sort(key=lambda item: (item["robustness"], item["score"]), reverse=True)
     return {
         "evaluated": len(variants),
         "best": variants[0] if variants else None,
