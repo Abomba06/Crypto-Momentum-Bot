@@ -159,6 +159,15 @@ class BotConfig:
     sentiment_news_limit: int
     sentiment_twitter_limit: int
     sentiment_twitter_rss_url: str
+    twitter_primary_enabled: bool
+    twitter_primary_mode: str
+    twitter_event_min_score: float
+    twitter_event_max_age_minutes: int
+    twitter_event_cooldown_secs: int
+    twitter_watchlist_path: pathlib.Path
+    twitter_require_confirmation_for_entry: bool
+    twitter_allow_exit_interrupt: bool
+    twitter_account_rss_url: str
     max_breakout_atr_extension: float
     max_entry_rsi: float
     ema_slope_lookback: int
@@ -171,6 +180,7 @@ class BotConfig:
     pullback_ema_buffer_atr: float
     shock_sentiment_threshold: float
     signals_csv: pathlib.Path
+    twitter_events_csv: pathlib.Path
     research_report: pathlib.Path
     rs_lookback: int
     min_relative_strength: float
@@ -269,6 +279,7 @@ class BotConfig:
             run_log=logs_dir / "run.log",
             trades_csv=logs_dir / "trades.csv",
             signals_csv=logs_dir / "signals.csv",
+            twitter_events_csv=logs_dir / "twitter_events.csv",
             research_report=logs_dir / "research_report.json",
             state_path=state_path,
             initial_cash=float(os.getenv("INITIAL_CASH", "100000")),
@@ -283,7 +294,7 @@ class BotConfig:
             sentiment_mode=os.getenv("SENTIMENT_MODE", "confirm").strip().lower(),
             sentiment_sources=[
                 source.strip().lower()
-                for source in os.getenv("SENTIMENT_SOURCES", "news").split(",")
+                for source in os.getenv("SENTIMENT_SOURCES", "twitter,news").split(",")
                 if source.strip()
             ],
             sentiment_lookback_hours=int(os.getenv("SENTIMENT_LOOKBACK_HOURS", "24")),
@@ -300,6 +311,15 @@ class BotConfig:
                 "SENTIMENT_TWITTER_RSS_URL",
                 "https://nitter.net/search/rss?f=tweets&q={query}",
             ).strip(),
+            twitter_primary_enabled=os.getenv("TWITTER_PRIMARY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
+            twitter_primary_mode=os.getenv("TWITTER_PRIMARY_MODE", "confirm").strip().lower(),
+            twitter_event_min_score=float(os.getenv("TWITTER_EVENT_MIN_SCORE", "0.20")),
+            twitter_event_max_age_minutes=int(os.getenv("TWITTER_EVENT_MAX_AGE_MINUTES", "120")),
+            twitter_event_cooldown_secs=int(os.getenv("TWITTER_EVENT_COOLDOWN_SECS", "1800")),
+            twitter_watchlist_path=pathlib.Path(os.getenv("TWITTER_WATCHLIST_PATH", "config/twitter_watchlist.sample.json")),
+            twitter_require_confirmation_for_entry=os.getenv("TWITTER_REQUIRE_CONFIRMATION_FOR_ENTRY", "false").strip().lower() in {"1", "true", "yes", "on"},
+            twitter_allow_exit_interrupt=os.getenv("TWITTER_ALLOW_EXIT_INTERRUPT", "true").strip().lower() in {"1", "true", "yes", "on"},
+            twitter_account_rss_url=os.getenv("TWITTER_ACCOUNT_RSS_URL", "https://nitter.net/{username}/rss").strip(),
             max_breakout_atr_extension=float(os.getenv("MAX_BREAKOUT_ATR_EXTENSION", "0.8")),
             max_entry_rsi=float(os.getenv("MAX_ENTRY_RSI", "72")),
             ema_slope_lookback=int(os.getenv("EMA_SLOPE_LOOKBACK", "3")),
@@ -440,6 +460,15 @@ def ensure_signals_csv(config: BotConfig) -> None:
             writer.writerow(header)
 
 
+def ensure_twitter_events_csv(config: BotConfig) -> None:
+    header = ["ts", "symbol", "author", "event_type", "score", "confirmation_state", "action", "reason", "text"]
+    is_new = not config.twitter_events_csv.exists()
+    with config.twitter_events_csv.open("a", newline="", encoding="utf-8") as file_obj:
+        writer = csv.writer(file_obj)
+        if is_new:
+            writer.writerow(header)
+
+
 def write_trade(
     config: BotConfig,
     symbol: str,
@@ -494,6 +523,33 @@ def write_signal_journal(
                 f"{safe_float(trend_value):.4f}",
                 action,
                 reason,
+            ]
+        )
+
+
+def write_twitter_event_journal(
+    config: BotConfig,
+    symbol: str,
+    snapshot: Optional[SentimentSnapshot],
+    action: str,
+    reason: str,
+) -> None:
+    if snapshot is None or not snapshot.top_twitter_posts:
+        return
+    ensure_twitter_events_csv(config)
+    top_item = next((item for item in snapshot.items if item.source == "twitter"), None)
+    with config.twitter_events_csv.open("a", newline="", encoding="utf-8") as file_obj:
+        csv.writer(file_obj).writerow(
+            [
+                now_utc().isoformat(),
+                symbol,
+                "" if top_item is None else top_item.author_display_name or top_item.author_username,
+                snapshot.dominant_event_type,
+                f"{safe_float(snapshot.primary_twitter_score):.4f}",
+                snapshot.confirmation_state,
+                action,
+                reason,
+                snapshot.top_twitter_posts[0][:240],
             ]
         )
 
@@ -637,6 +693,12 @@ def print_dashboard(
             headlines = snapshot.get("top_headlines", [])
             if headlines:
                 lines.append(f"    headlines: {headlines[0][:120]}")
+            twitter_posts = snapshot.get("top_twitter_posts", [])
+            if twitter_posts:
+                lines.append(f"    x: {twitter_posts[0][:120]}")
+            news_posts = snapshot.get("top_news_headlines", [])
+            if news_posts:
+                lines.append(f"    news: {news_posts[0][:120]}")
             reason = snapshot.get("reason")
             if reason:
                 lines.append(f"    reason: {reason}")
@@ -1354,8 +1416,14 @@ def update_symbol_snapshot(
         "cross_asset_multiplier": 1.0 if cross_asset is None else cross_asset_multiplier(symbol, cross_asset),
         "sentiment_score": None if sentiment_snapshot is None else sentiment_snapshot.score,
         "sentiment_label": "n/a" if sentiment_snapshot is None else sentiment_snapshot.label,
+        "twitter_score": None if sentiment_snapshot is None else sentiment_snapshot.primary_twitter_score,
+        "news_score": None if sentiment_snapshot is None else sentiment_snapshot.news_confirmation_score,
+        "confirmation_state": "n/a" if sentiment_snapshot is None else sentiment_snapshot.confirmation_state,
+        "dominant_event_type": "none" if sentiment_snapshot is None else sentiment_snapshot.dominant_event_type,
         "sentiment_samples": 0 if sentiment_snapshot is None else sentiment_snapshot.sample_size,
         "top_headlines": [] if sentiment_snapshot is None else sentiment_snapshot.top_headlines[:2],
+        "top_twitter_posts": [] if sentiment_snapshot is None or sentiment_snapshot.top_twitter_posts is None else sentiment_snapshot.top_twitter_posts[:2],
+        "top_news_headlines": [] if sentiment_snapshot is None or sentiment_snapshot.top_news_headlines is None else sentiment_snapshot.top_news_headlines[:2],
         "event_counts": {} if sentiment_snapshot is None else sentiment_snapshot.event_counts,
         "entry_ready": entry_signal is not None,
         "setup_label": "idle" if entry_signal is None else f"{entry_signal.source} {entry_signal.confidence:.2f}",
@@ -1878,7 +1946,8 @@ def build_news_momentum_signal(
 ) -> Optional[EntrySignal]:
     if snapshot is None:
         return None
-    if snapshot.score < config.sentiment_buy_threshold:
+    primary_score = snapshot.primary_twitter_score if config.twitter_primary_enabled and snapshot.top_twitter_posts else snapshot.score
+    if primary_score < config.sentiment_buy_threshold:
         return None
     if snapshot.acceleration < config.news_momentum_min_acceleration:
         return None
@@ -1890,6 +1959,8 @@ def build_news_momentum_signal(
         if item.published_at is not None
         and (now - item.published_at).total_seconds() <= config.news_momentum_max_age_hours * 3600
     ]
+    if config.twitter_primary_enabled:
+        recent_items = [item for item in recent_items if item.source == "twitter"] or recent_items
     if len(recent_items) < config.news_momentum_min_recent_items:
         return None
 
@@ -1912,7 +1983,7 @@ def build_news_momentum_signal(
 
     recent_share = len(recent_items) / max(snapshot.sample_size, 1)
     confidence = 0.74
-    confidence += min(0.10, max(0.0, snapshot.score - config.sentiment_buy_threshold) * 0.4)
+    confidence += min(0.10, max(0.0, primary_score - config.sentiment_buy_threshold) * 0.4)
     confidence += min(0.08, max(0.0, snapshot.acceleration - config.news_momentum_min_acceleration) * 0.6)
     confidence += min(0.05, catalyst_count * 0.02)
     confidence += min(0.05, recent_share * 0.05)
@@ -2111,6 +2182,9 @@ def score_setup(
 def sentiment_allows_entry(config: BotConfig, snapshot: Optional[SentimentSnapshot]) -> bool:
     if not config.sentiment_enabled or config.sentiment_mode == "disabled":
         return True
+    if config.twitter_primary_enabled and snapshot is not None and snapshot.primary_twitter_score > 0:
+        if config.twitter_require_confirmation_for_entry and snapshot.confirmation_state not in {"confirmed_by_news", "partially_confirmed"}:
+            return False
     if config.sentiment_mode != "confirm":
         return True
     return snapshot is not None and snapshot.score >= config.sentiment_buy_threshold
@@ -2130,7 +2204,14 @@ def sentiment_triggers_exit(config: BotConfig, snapshot: Optional[SentimentSnaps
         config.sentiment_enabled
         and config.sentiment_exit_on_bearish
         and snapshot is not None
-        and snapshot.score <= config.sentiment_sell_threshold
+        and (
+            snapshot.score <= config.sentiment_sell_threshold
+            or (
+                config.twitter_primary_enabled
+                and config.twitter_allow_exit_interrupt
+                and snapshot.primary_twitter_score <= config.sentiment_sell_threshold
+            )
+        )
     )
 
 
@@ -2492,6 +2573,8 @@ def process_symbol(
                 log_line(
                     config,
                     f"{symbol} sentiment={sentiment_snapshot.score:.3f} "
+                    f"twitter={sentiment_snapshot.primary_twitter_score:.3f} news={sentiment_snapshot.news_confirmation_score:.3f} "
+                    f"confirm={sentiment_snapshot.confirmation_state} event={sentiment_snapshot.dominant_event_type} "
                     f"label={sentiment_snapshot.label} accel={sentiment_snapshot.acceleration:.3f} "
                     f"samples={sentiment_snapshot.sample_size} sources={sentiment_snapshot.source_counts} "
                     f"events={sentiment_snapshot.event_counts}",
@@ -2663,9 +2746,10 @@ def process_symbol(
                 candidate_score,
                 None if sentiment_snapshot is None else sentiment_snapshot.score,
                 trend_value,
-                "candidate",
-                entry_signal.reason,
-            )
+                    "candidate",
+                    entry_signal.reason,
+                )
+            write_twitter_event_journal(config, symbol, sentiment_snapshot, action_label, entry_signal.reason)
         else:
             if action_label == "watch":
                 action_label = "no setup" if rel_strength >= config.min_relative_strength else "weak rs"
@@ -2943,6 +3027,14 @@ def main() -> None:
         news_limit=config.sentiment_news_limit,
         twitter_limit=config.sentiment_twitter_limit,
         twitter_rss_url=config.sentiment_twitter_rss_url,
+        twitter_watchlist_path=str(config.twitter_watchlist_path),
+        twitter_account_rss_url=config.twitter_account_rss_url,
+        twitter_primary_enabled=config.twitter_primary_enabled,
+        twitter_primary_mode=config.twitter_primary_mode,
+        twitter_event_min_score=config.twitter_event_min_score,
+        twitter_event_max_age_minutes=config.twitter_event_max_age_minutes,
+        twitter_require_confirmation_for_entry=config.twitter_require_confirmation_for_entry,
+        twitter_allow_exit_interrupt=config.twitter_allow_exit_interrupt,
     )
     started_at = now_utc()
     state = load_state(config)
@@ -2950,6 +3042,7 @@ def main() -> None:
     symbols = [symbol for symbol in config.symbols if data_client.probe_symbol(symbol)]
     ensure_trades_csv(config)
     ensure_signals_csv(config)
+    ensure_twitter_events_csv(config)
     init_daily_controls(config, state)
     init_weekly_controls(config, state)
     log_line(config, f"Active universe: {symbols}")
