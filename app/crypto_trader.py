@@ -207,6 +207,10 @@ class BotConfig:
     correlation_reduce_threshold: float
     correlation_hard_limit: float
     correlation_risk_floor: float
+    order_slice_notional_threshold: float
+    max_order_slices: int
+    spread_guard_bps: float
+    microstructure_floor: float
     adaptive_regime_enabled: bool
     adaptive_regime_lookback: int
     volatility_targeting_enabled: bool
@@ -366,6 +370,10 @@ class BotConfig:
             correlation_reduce_threshold=float(os.getenv("CORRELATION_REDUCE_THRESHOLD", "0.72")),
             correlation_hard_limit=float(os.getenv("CORRELATION_HARD_LIMIT", "0.88")),
             correlation_risk_floor=float(os.getenv("CORRELATION_RISK_FLOOR", "0.58")),
+            order_slice_notional_threshold=float(os.getenv("ORDER_SLICE_NOTIONAL_THRESHOLD", "3500")),
+            max_order_slices=int(os.getenv("MAX_ORDER_SLICES", "3")),
+            spread_guard_bps=float(os.getenv("SPREAD_GUARD_BPS", "18")),
+            microstructure_floor=float(os.getenv("MICROSTRUCTURE_FLOOR", "0.65")),
             adaptive_regime_enabled=os.getenv("ADAPTIVE_REGIME_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
             adaptive_regime_lookback=int(os.getenv("ADAPTIVE_REGIME_LOOKBACK", "252")),
             volatility_targeting_enabled=os.getenv("VOLATILITY_TARGETING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
@@ -462,6 +470,15 @@ class CorrelationContext:
     risk_multiplier: float
     heat_multiplier: float
     is_clustered: bool
+
+
+@dataclass(frozen=True)
+class MicrostructureSnapshot:
+    spread_bps: float
+    close_location: float
+    imbalance: float
+    score: float
+    allow_entry: bool
 
 
 def default_state(initial_cash: float) -> Dict[str, Any]:
@@ -600,19 +617,34 @@ def submit_order_with_safeguards(
     symbol: str,
     side: str,
     qty: float,
+    reference_price: float = 0.0,
+    execution_quality: float = 1.0,
 ) -> Tuple[Optional[Order], float, Optional[str]]:
     qty_attempt = max(0.0, qty)
     tier = liquidity_tier(symbol)
     max_attempts = max(1, config.max_order_retries + 1)
     last_error: Optional[str] = None
+    submitted_total = 0.0
+    first_order: Optional[Order] = None
+    slice_count = 1 if side != "buy" else execution_slice_count(config, symbol, qty_attempt, reference_price, execution_quality)
     for attempt in range(max_attempts):
         try:
-            if side == "buy":
-                order = broker.submit_market_buy(symbol, qty_attempt)
-            else:
-                order = broker.submit_market_sell(symbol, qty_attempt)
+            remaining = qty_attempt
+            for slice_idx in range(slice_count):
+                slice_qty = remaining if slice_idx >= slice_count - 1 else remaining / float(slice_count - slice_idx)
+                if side == "buy":
+                    order = broker.submit_market_buy(symbol, slice_qty)
+                else:
+                    order = broker.submit_market_sell(symbol, slice_qty)
+                if first_order is None:
+                    first_order = order
+                submitted_total += slice_qty
+                remaining = max(0.0, remaining - slice_qty)
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
+            if submitted_total > 0:
+                clear_order_failure_state(sym_state)
+                return first_order, submitted_total, last_error
             if attempt >= max_attempts - 1:
                 record_order_failure(config, sym_state, last_error)
                 return None, qty_attempt, last_error
@@ -626,8 +658,8 @@ def submit_order_with_safeguards(
                 return None, qty_attempt, last_error
             continue
         clear_order_failure_state(sym_state)
-        return order, qty_attempt, None
-    return None, qty_attempt, last_error
+        return first_order, submitted_total if submitted_total > 0 else qty_attempt, None
+    return first_order, submitted_total if submitted_total > 0 else qty_attempt, last_error
 
 
 def print_dashboard(
@@ -1993,6 +2025,49 @@ def estimate_execution_quality(symbol: str, atr_pct: float, vol_ratio: float) ->
     return max(0.35, min(1.0, quality))
 
 
+def microstructure_snapshot(
+    config: BotConfig,
+    symbol: str,
+    closes: List[float],
+    highs: List[float],
+    lows: List[float],
+    volumes: List[float],
+) -> MicrostructureSnapshot:
+    spread_bps = safe_float(SPREAD_BPS_MAP.get(symbol, 12.0), 12.0)
+    last = closes[-1] if closes else 0.0
+    last_high = highs[-1] if highs else last
+    last_low = lows[-1] if lows else last
+    candle_range = max(1e-9, last_high - last_low)
+    close_location = max(0.0, min(1.0, (last - last_low) / candle_range))
+    vol_ratio = volume_ratio(volumes, config.volume_window)
+    flow_bias = 0.0 if not math.isfinite(vol_ratio) else min(0.25, max(-0.20, (vol_ratio - 1.0) * 0.18))
+    imbalance = ((close_location - 0.5) * 0.8) + flow_bias
+    spread_penalty = min(0.22, spread_bps / 120.0)
+    score = 0.86 - spread_penalty + max(-0.18, min(0.14, imbalance))
+    allow_entry = spread_bps <= config.spread_guard_bps and score >= config.microstructure_floor
+    return MicrostructureSnapshot(
+        spread_bps=spread_bps,
+        close_location=close_location,
+        imbalance=imbalance,
+        score=max(0.35, min(1.0, score)),
+        allow_entry=allow_entry,
+    )
+
+
+def execution_slice_count(config: BotConfig, symbol: str, qty: float, reference_price: float, execution_quality: float) -> int:
+    if qty <= 0 or reference_price <= 0:
+        return 1
+    notional = qty * reference_price
+    slices = 1
+    if notional > config.order_slice_notional_threshold:
+        slices = int(math.ceil(notional / max(config.order_slice_notional_threshold, 1.0)))
+    if safe_float(SPREAD_BPS_MAP.get(symbol, 12.0), 12.0) > config.spread_guard_bps * 0.8:
+        slices += 1
+    if execution_quality < 0.72:
+        slices += 1
+    return max(1, min(config.max_order_slices, slices))
+
+
 def build_entry_signal(
     config: BotConfig,
     closes: List[float],
@@ -2614,7 +2689,16 @@ def execute_ranked_entries(
             )
             continue
 
-        order, submitted_qty, error_message = submit_order_with_safeguards(config, broker, sym_state, symbol, "buy", buy_qty)
+        order, submitted_qty, error_message = submit_order_with_safeguards(
+            config,
+            broker,
+            sym_state,
+            symbol,
+            "buy",
+            buy_qty,
+            candidate.signal.breakout_level,
+            candidate.execution_quality,
+        )
         if order is None:
             snapshot = state.get("sym", {}).get(symbol, {}).get("snapshot")
             if snapshot is not None:
@@ -2793,7 +2877,8 @@ def process_symbol(
     eth_benchmark = benchmark_context.get("ETH/USD")
     benchmark = btc_benchmark if symbol != "BTC/USD" else eth_benchmark
     rel_strength = relative_strength_score(closes, benchmark, config.rs_lookback)
-    execution_quality = estimate_execution_quality(symbol, atr_pct_live, vol_ratio_live)
+    micro = microstructure_snapshot(config, symbol, closes, highs, lows, volumes)
+    execution_quality = min(estimate_execution_quality(symbol, atr_pct_live, vol_ratio_live), micro.score)
     symbol_liquidity_tier = liquidity_tier(symbol)
     symbol_cross_asset_factor = cross_asset_multiplier(symbol, cross_asset) * cross_asset.risk_multiplier
     breakout_signal = build_entry_signal(config, closes, highs, lows, volumes)
@@ -2882,6 +2967,8 @@ def process_symbol(
         news_momentum_signal = build_news_momentum_signal(config, closes, highs, lows, volumes, sentiment_snapshot)
         if news_momentum_signal and (trend_ok or sentiment_triggers_primary_entry(config, sentiment_snapshot)):
             setup_options.append(news_momentum_signal)
+        if not micro.allow_entry:
+            setup_options = [signal for signal in setup_options if signal.source in {"sentiment", "news_momentum"}]
 
         if not trend_ok and regime.allow_trend:
             setup_options = [signal for signal in setup_options if signal.source in {"sentiment", "reversal", "news_momentum"}]
@@ -2914,6 +3001,26 @@ def process_symbol(
                     cross_asset=cross_asset,
                 )
                 log_line(config, f"{symbol} sentiment did not confirm long entry.")
+                sym_state["prev_price"] = last
+                return None
+            if not micro.allow_entry and not sentiment_triggers_primary_entry(config, sentiment_snapshot):
+                action_label = "spread reject"
+                update_symbol_snapshot(
+                    state,
+                    symbol,
+                    last=last,
+                    position=position,
+                    trend_ok=trend_ok,
+                    trend_value=trend_value,
+                    sentiment_snapshot=sentiment_snapshot,
+                    entry_signal=entry_signal,
+                    last_action=action_label,
+                    regime=regime,
+                    relative_strength=rel_strength,
+                    execution_quality=execution_quality,
+                    cross_asset=cross_asset,
+                )
+                log_line(config, f"{symbol} microstructure blocked long entry: spread={micro.spread_bps:.1f}bps score={micro.score:.2f}")
                 sym_state["prev_price"] = last
                 return None
 

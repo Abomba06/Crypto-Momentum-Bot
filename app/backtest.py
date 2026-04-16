@@ -66,6 +66,10 @@ class BacktestConfig:
     correlation_reduce_threshold: float = 0.72
     correlation_hard_limit: float = 0.88
     correlation_risk_floor: float = 0.58
+    order_slice_notional_threshold: float = 3500.0
+    max_order_slices: int = 3
+    spread_guard_bps: float = 18.0
+    microstructure_floor: float = 0.65
     event_stream: Dict[str, List[ReplayEvent]] = field(default_factory=dict)
     adaptive_regime_enabled: bool = True
     adaptive_regime_lookback: int = 252
@@ -176,6 +180,10 @@ def as_runtime_config(config: BacktestConfig) -> Any:
         correlation_reduce_threshold=config.correlation_reduce_threshold,
         correlation_hard_limit=config.correlation_hard_limit,
         correlation_risk_floor=config.correlation_risk_floor,
+        order_slice_notional_threshold=config.order_slice_notional_threshold,
+        max_order_slices=config.max_order_slices,
+        spread_guard_bps=config.spread_guard_bps,
+        microstructure_floor=config.microstructure_floor,
         twitter_primary_enabled=bool(config.event_stream),
         twitter_primary_mode="accelerate",
         twitter_event_max_age_minutes=120,
@@ -257,6 +265,10 @@ def portfolio_runtime_config(config: BacktestConfig) -> Any:
     runtime.correlation_reduce_threshold = config.correlation_reduce_threshold
     runtime.correlation_hard_limit = config.correlation_hard_limit
     runtime.correlation_risk_floor = config.correlation_risk_floor
+    runtime.order_slice_notional_threshold = config.order_slice_notional_threshold
+    runtime.max_order_slices = config.max_order_slices
+    runtime.spread_guard_bps = config.spread_guard_bps
+    runtime.microstructure_floor = config.microstructure_floor
     runtime.adaptive_regime_enabled = config.adaptive_regime_enabled
     runtime.adaptive_regime_lookback = config.adaptive_regime_lookback
     runtime.volatility_targeting_enabled = config.volatility_targeting_enabled
@@ -320,7 +332,8 @@ def simulate_strategy(df: pd.DataFrame, config: Optional[BacktestConfig] = None)
             crypto_trader.detect_regime(trend_ok, trend_value, atr_pct_live, vol_ratio_live, event_snapshot),
             adaptive_state,
         )
-        execution_quality = crypto_trader.estimate_execution_quality(config.symbol, atr_pct_live, vol_ratio_live)
+        micro = crypto_trader.microstructure_snapshot(runtime, config.symbol, window_closes, window_highs, window_lows, window_volumes)
+        execution_quality = min(crypto_trader.estimate_execution_quality(config.symbol, atr_pct_live, vol_ratio_live), micro.score)
 
         if qty <= 0:
             setup_options = []
@@ -339,6 +352,8 @@ def simulate_strategy(df: pd.DataFrame, config: Optional[BacktestConfig] = None)
                 setup_options.append(reversal_signal)
             if event_signal is not None:
                 setup_options.append(event_signal)
+            if not micro.allow_entry:
+                setup_options = [item for item in setup_options if item.source in {"sentiment", "news_momentum"}]
             if setup_options:
                 signal = sorted(
                     setup_options,
@@ -575,7 +590,8 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
             )
             benchmark = closes["BTC/USD"][: idx + 1] if "BTC/USD" in closes and symbol != "BTC/USD" else None
             rel_strength = crypto_trader.relative_strength_score(window_closes, benchmark, runtime.rs_lookback)
-            execution_quality = crypto_trader.estimate_execution_quality(symbol, atr_pct_live, vol_ratio_live)
+            micro = crypto_trader.microstructure_snapshot(runtime, symbol, window_closes, window_highs, window_lows, window_volumes)
+            execution_quality = min(crypto_trader.estimate_execution_quality(symbol, atr_pct_live, vol_ratio_live), micro.score)
             setup_options = []
             breakout_signal = crypto_trader.build_entry_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             pullback_signal = crypto_trader.build_pullback_entry_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
@@ -592,6 +608,8 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                 setup_options.append(reversal_signal)
             if event_signal is not None:
                 setup_options.append(event_signal)
+            if not micro.allow_entry:
+                setup_options = [item for item in setup_options if item.source in {"sentiment", "news_momentum"}]
             if not setup_options or rel_strength < runtime.min_relative_strength or execution_quality < runtime.min_execution_quality:
                 continue
             if event_snapshot is not None and not crypto_trader.sentiment_allows_entry(runtime, event_snapshot):

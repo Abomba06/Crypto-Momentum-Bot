@@ -118,6 +118,10 @@ def make_config(case_name: str) -> crypto_trader.BotConfig:
         correlation_reduce_threshold=0.72,
         correlation_hard_limit=0.88,
         correlation_risk_floor=0.58,
+        order_slice_notional_threshold=3500.0,
+        max_order_slices=3,
+        spread_guard_bps=18.0,
+        microstructure_floor=0.65,
         adaptive_regime_enabled=True,
         adaptive_regime_lookback=252,
         volatility_targeting_enabled=True,
@@ -366,6 +370,22 @@ class StrategySmokeTests(unittest.TestCase):
         }
         multiplier = crypto_trader.correlation_overlap_multiplier(config, candidate, ["BTC/USD"], accepted, price_map)
         self.assertLess(multiplier, 1.0)
+
+    def test_microstructure_snapshot_blocks_wide_spread_entry(self):
+        config = make_config("microstructure")
+        config = crypto_trader.BotConfig(**{**config.__dict__, "spread_guard_bps": 8.0})
+        closes = [100.0 + (i * 0.05) for i in range(80)]
+        highs = [c + 0.4 for c in closes]
+        lows = [c - 0.4 for c in closes]
+        volumes = [1000.0 + (i % 4) * 40 for i in range(80)]
+        snap = crypto_trader.microstructure_snapshot(config, "DOGE/USD", closes, highs, lows, volumes)
+        self.assertFalse(snap.allow_entry)
+        self.assertLess(snap.score, 0.9)
+
+    def test_execution_slice_count_scales_up_for_large_notional(self):
+        config = make_config("slice_count")
+        slices = crypto_trader.execution_slice_count(config, "ETH/USD", 80.0, 100.0, 0.68)
+        self.assertGreaterEqual(slices, 2)
 
     def test_failed_breakdown_signal_can_trigger(self):
         config = make_config("reversal")
