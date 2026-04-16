@@ -1618,6 +1618,8 @@ def update_symbol_snapshot(
         "news_score": None if sentiment_snapshot is None else sentiment_snapshot.news_confirmation_score,
         "confirmation_state": "n/a" if sentiment_snapshot is None else sentiment_snapshot.confirmation_state,
         "dominant_event_type": "none" if sentiment_snapshot is None else sentiment_snapshot.dominant_event_type,
+        "predicted_event_type": "none" if sentiment_snapshot is None else sentiment_snapshot.predicted_event_type,
+        "predicted_event_probability": 0.0 if sentiment_snapshot is None else sentiment_snapshot.predicted_event_probability,
         "sentiment_samples": 0 if sentiment_snapshot is None else sentiment_snapshot.sample_size,
         "top_headlines": [] if sentiment_snapshot is None else sentiment_snapshot.top_headlines[:2],
         "top_twitter_posts": [] if sentiment_snapshot is None or sentiment_snapshot.top_twitter_posts is None else sentiment_snapshot.top_twitter_posts[:2],
@@ -2190,6 +2192,7 @@ def build_news_momentum_signal(
     volumes: List[float],
     snapshot: Optional[SentimentSnapshot],
 ) -> Optional[EntrySignal]:
+    bullish_predicted_tags = {"approval", "etf", "listing", "partnership", "upgrade", "launch", "adoption"}
     if snapshot is None:
         return None
     primary_score = snapshot.primary_twitter_score if config.twitter_primary_enabled and snapshot.top_twitter_posts else snapshot.score
@@ -2224,7 +2227,11 @@ def build_news_momentum_signal(
         sum(item.weight for item in recent_items),
         1e-9,
     )
-    if catalyst_count <= 0 and recent_weighted_score < config.sentiment_buy_threshold + 0.05:
+    predictive_catalyst = (
+        snapshot.predicted_event_type in bullish_predicted_tags
+        and snapshot.predicted_event_probability >= 0.58
+    )
+    if catalyst_count <= 0 and recent_weighted_score < config.sentiment_buy_threshold + 0.05 and not predictive_catalyst:
         return None
 
     if len(closes) < config.warmup_ltf:
@@ -2247,6 +2254,8 @@ def build_news_momentum_signal(
     confidence += min(0.08, max(0.0, snapshot.acceleration - config.news_momentum_min_acceleration) * 0.6)
     confidence += min(0.05, catalyst_count * 0.02)
     confidence += min(0.05, recent_share * 0.05)
+    if predictive_catalyst:
+        confidence += min(0.07, snapshot.predicted_event_probability * 0.08)
     if math.isfinite(rsi_value):
         confidence -= min(0.08, max(0.0, rsi_value - config.max_entry_rsi) / 200.0)
     return EntrySignal(
@@ -2422,6 +2431,10 @@ def score_setup(
 ) -> float:
     sentiment_score = 0.0 if sentiment_snapshot is None else sentiment_snapshot.score
     acceleration = 0.0 if sentiment_snapshot is None else sentiment_snapshot.acceleration
+    predicted_event_probability = 0.0 if sentiment_snapshot is None else sentiment_snapshot.predicted_event_probability
+    predicted_event_type = "none" if sentiment_snapshot is None else sentiment_snapshot.predicted_event_type
+    bullish_predicted_tags = {"approval", "etf", "listing", "partnership", "upgrade", "launch", "adoption"}
+    bearish_predicted_tags = {"hack", "exploit", "lawsuit", "investigation", "delisting", "liquidation"}
     source_bonus = {
         "technical": 0.10,
         "pullback": 0.12,
@@ -2438,6 +2451,10 @@ def score_setup(
         + min(0.10, max(0.0, acceleration * 0.4))
         + min(0.18, max(-0.12, relative_strength * 1.8))
     )
+    if predicted_event_type in bullish_predicted_tags:
+        base += min(0.10, predicted_event_probability * 0.10)
+    elif predicted_event_type in bearish_predicted_tags:
+        base -= min(0.10, predicted_event_probability * 0.12)
     return base * regime.risk_multiplier * execution_quality * cross_asset_factor
 
 
@@ -2901,6 +2918,7 @@ def process_symbol(
                     f"{symbol} sentiment={sentiment_snapshot.score:.3f} "
                     f"twitter={sentiment_snapshot.primary_twitter_score:.3f} news={sentiment_snapshot.news_confirmation_score:.3f} "
                     f"confirm={sentiment_snapshot.confirmation_state} event={sentiment_snapshot.dominant_event_type} "
+                    f"predict={sentiment_snapshot.predicted_event_type}:{sentiment_snapshot.predicted_event_probability:.2f} "
                     f"label={sentiment_snapshot.label} accel={sentiment_snapshot.acceleration:.3f} "
                     f"samples={sentiment_snapshot.sample_size} sources={sentiment_snapshot.source_counts} "
                     f"events={sentiment_snapshot.event_counts}",

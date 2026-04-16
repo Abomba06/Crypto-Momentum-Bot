@@ -94,6 +94,25 @@ SOURCE_WEIGHTS = {
     "marketwatch": 1.0,
 }
 
+EVENT_FORECAST_PRIORS = {
+    "approval": 0.14,
+    "etf": 0.14,
+    "listing": 0.10,
+    "partnership": 0.08,
+    "upgrade": 0.08,
+    "launch": 0.06,
+    "adoption": 0.08,
+    "hack": -0.14,
+    "exploit": -0.14,
+    "lawsuit": -0.10,
+    "investigation": -0.10,
+    "delisting": -0.12,
+    "liquidation": -0.08,
+}
+
+BULLISH_EVENT_TYPES = {"approval", "etf", "listing", "partnership", "upgrade", "launch", "adoption"}
+BEARISH_EVENT_TYPES = {"hack", "exploit", "lawsuit", "investigation", "delisting", "liquidation"}
+
 SYMBOL_KEYWORDS = {
     "BTC/USD": ["bitcoin", "btc"],
     "ETH/USD": ["ethereum", "eth"],
@@ -145,6 +164,8 @@ class SentimentSnapshot:
     news_confirmation_score: float = 0.0
     confirmation_state: str = "no_twitter_event"
     dominant_event_type: str = "none"
+    predicted_event_type: str = "none"
+    predicted_event_probability: float = 0.0
 
 
 def tokenize(text: str) -> List[str]:
@@ -279,6 +300,39 @@ def recency_weight(published_at: Optional[datetime], now: datetime, lookback_hou
     return max(0.35, min(1.15, weight))
 
 
+def forecast_event_type(
+    items: Sequence[SentimentItem],
+    history: Sequence[SentimentSnapshot],
+    now: datetime,
+    lookback_hours: int,
+) -> tuple[str, float]:
+    scores: Dict[str, float] = {}
+    for item in items:
+        freshness = recency_weight(item.published_at, now, max(2, lookback_hours))
+        signed_weight = item.score * item.weight * freshness
+        for tag in item.event_tags:
+            scores[tag] = scores.get(tag, 0.0) + signed_weight + EVENT_FORECAST_PRIORS.get(tag, 0.0)
+
+    for age_idx, snapshot in enumerate(reversed(list(history)[-6:]), start=1):
+        decay = max(0.18, 0.78 ** age_idx)
+        dominant = snapshot.dominant_event_type
+        if dominant != "none":
+            scores[dominant] = scores.get(dominant, 0.0) + (snapshot.score * 0.35 * decay)
+        predicted = snapshot.predicted_event_type
+        if predicted != "none":
+            scores[predicted] = scores.get(predicted, 0.0) + (snapshot.predicted_event_probability * 0.30 * decay)
+
+    if not scores:
+        return "none", 0.0
+
+    best_tag, raw_score = max(scores.items(), key=lambda item: abs(item[1]))
+    abs_score = abs(raw_score)
+    if abs_score < 0.12:
+        return "none", 0.0
+    probability = min(0.92, 0.38 + abs_score * 0.42)
+    return best_tag, max(0.0, probability)
+
+
 class SentimentClient:
     def __init__(
         self,
@@ -328,6 +382,7 @@ class SentimentClient:
         self.twitter_allow_exit_interrupt = twitter_allow_exit_interrupt
         self.watchlist: List[TwitterWatchAccount] = load_watchlist(self.twitter_watchlist_path)
         self._cache: Dict[str, SentimentSnapshot] = {}
+        self._history: Dict[str, List[SentimentSnapshot]] = {}
 
     def is_active(self) -> bool:
         return self.enabled and self.mode != "disabled" and bool(self.sources)
@@ -394,6 +449,7 @@ class SentimentClient:
         recent_score = sum(item.score * item.weight for item in recent) / max(sum(item.weight for item in recent), 1e-9) if recent else score
         older_score = sum(item.score * item.weight for item in older) / max(sum(item.weight for item in older), 1e-9) if older else score
         acceleration = recent_score - older_score
+        predicted_event_type, predicted_event_probability = forecast_event_type(items, self._history.get(symbol, []), now, self.lookback_hours)
 
         snapshot = SentimentSnapshot(
             symbol=symbol,
@@ -411,9 +467,15 @@ class SentimentClient:
             news_confirmation_score=max(-1.0, min(1.0, news_confirmation_score)),
             confirmation_state=confirmation_state,
             dominant_event_type=dominant_event_type(items),
+            predicted_event_type=predicted_event_type,
+            predicted_event_probability=predicted_event_probability,
             updated_at=now,
         )
         self._cache[symbol] = snapshot
+        history = self._history.setdefault(symbol, [])
+        history.append(snapshot)
+        if len(history) > 24:
+            del history[:-24]
         return snapshot
 
     def _confirmation_state(self, twitter_items: Sequence[SentimentItem], news_items: Sequence[SentimentItem]) -> str:

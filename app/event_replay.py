@@ -75,6 +75,8 @@ def event_to_snapshot(event: ReplayEvent) -> SentimentSnapshot:
         news_confirmation_score=event.news_score,
         confirmation_state=event.confirmation_state,
         dominant_event_type=event.dominant_event_type,
+        predicted_event_type=event.dominant_event_type,
+        predicted_event_probability=0.7 if event.dominant_event_type != "none" else 0.0,
     )
 
 

@@ -588,6 +588,35 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertIsNotNone(snapshot)
         self.assertIn("approval", snapshot.event_counts)
         self.assertGreaterEqual(len(snapshot.top_headlines), 1)
+        self.assertIn(snapshot.predicted_event_type, {"approval", "etf", "none"})
+        self.assertGreaterEqual(snapshot.predicted_event_probability, 0.0)
+
+    def test_forecast_event_type_uses_recent_repeated_catalysts(self):
+        now = crypto_trader.now_utc()
+        items = [
+            sentiment.SentimentItem("twitter", "watch", "ETF approval chatter", now, 0.7, 1.2, 1.0, ["approval", "etf"]),
+            sentiment.SentimentItem("news", "news", "ETF listing expected", now, 0.5, 1.0, 1.0, ["listing", "etf"]),
+        ]
+        history = [
+            sentiment.SentimentSnapshot(
+                symbol="BTC/USD",
+                score=0.4,
+                label="bullish",
+                sample_size=2,
+                source_counts={"twitter": 1},
+                items=[],
+                top_headlines=["Prior ETF chatter"],
+                event_counts={"etf": 1},
+                acceleration=0.2,
+                updated_at=now,
+                dominant_event_type="etf",
+                predicted_event_type="etf",
+                predicted_event_probability=0.62,
+            )
+        ]
+        predicted_type, probability = sentiment.forecast_event_type(items, history, now, 24)
+        self.assertIn(predicted_type, {"approval", "etf", "listing"})
+        self.assertGreater(probability, 0.5)
 
     def test_sentiment_client_can_use_watchlist_twitter_as_primary(self):
         now = crypto_trader.now_utc()
