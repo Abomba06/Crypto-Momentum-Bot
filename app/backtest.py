@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from datetime import datetime
 from types import SimpleNamespace
 from itertools import product
 from typing import Any, Dict, List, Optional
@@ -7,6 +8,7 @@ import pandas as pd
 import yfinance as yf
 
 from app import crypto_trader
+from app.event_replay import ReplayEvent, active_event_snapshot
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,7 @@ class BacktestConfig:
     max_theme_exposure: float = 0.28
     correlation_penalty_same_sector: float = 0.88
     correlation_penalty_same_theme: float = 0.78
+    event_stream: Dict[str, List[ReplayEvent]] = field(default_factory=dict)
 
     @property
     def warmup_ltf(self) -> int:
@@ -129,6 +132,10 @@ def as_runtime_config(config: BacktestConfig) -> Any:
         min_atr_pct=config.min_atr_pct,
         volume_window=config.volume_window,
         min_volume_ratio=config.min_volume_ratio,
+        sentiment_enabled=bool(config.event_stream),
+        sentiment_mode="confirm",
+        sentiment_buy_threshold=0.15,
+        sentiment_sell_threshold=-0.15,
         warmup_ltf=config.warmup_ltf,
         warmup_htf=config.warmup_htf,
         max_breakout_atr_extension=config.max_breakout_atr_extension,
@@ -155,6 +162,11 @@ def as_runtime_config(config: BacktestConfig) -> Any:
         max_theme_exposure=config.max_theme_exposure,
         correlation_penalty_same_sector=config.correlation_penalty_same_sector,
         correlation_penalty_same_theme=config.correlation_penalty_same_theme,
+        twitter_primary_enabled=bool(config.event_stream),
+        twitter_primary_mode="accelerate",
+        twitter_event_max_age_minutes=120,
+        twitter_require_confirmation_for_entry=False,
+        twitter_allow_exit_interrupt=True,
     )
 
 
@@ -261,6 +273,7 @@ def simulate_strategy(df: pd.DataFrame, config: Optional[BacktestConfig] = None)
         window_lows = lows[: idx + 1]
         window_volumes = volumes[: idx + 1]
         last = window_closes[-1]
+        event_snapshot = active_event_snapshot(config.event_stream, config.symbol, index[idx].to_pydatetime(), runtime.twitter_event_max_age_minutes) if config.event_stream else None
 
         htf_closes = window_closes[-max(runtime.warmup_htf, runtime.htf_slow + runtime.htf_slope_n + 5) :]
         if len(htf_closes) < max(runtime.htf_slow + runtime.htf_slope_n, runtime.warmup_htf):
@@ -272,7 +285,7 @@ def simulate_strategy(df: pd.DataFrame, config: Optional[BacktestConfig] = None)
         atr_live = crypto_trader.atr(window_highs, window_lows, window_closes, runtime.atr_len)
         atr_pct_live = atr_live / max(last, 1e-9) if atr_live and atr_live == atr_live else 0.0
         vol_ratio_live = crypto_trader.volume_ratio(window_volumes, runtime.volume_window)
-        regime = crypto_trader.detect_regime(trend_ok, trend_value, atr_pct_live, vol_ratio_live, None)
+        regime = crypto_trader.detect_regime(trend_ok, trend_value, atr_pct_live, vol_ratio_live, event_snapshot)
         execution_quality = crypto_trader.estimate_execution_quality(config.symbol, atr_pct_live, vol_ratio_live)
 
         if qty <= 0:
@@ -281,6 +294,7 @@ def simulate_strategy(df: pd.DataFrame, config: Optional[BacktestConfig] = None)
             pullback_signal = crypto_trader.build_pullback_entry_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             compression_signal = crypto_trader.build_compression_breakout_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             reversal_signal = crypto_trader.build_failed_breakdown_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
+            event_signal = crypto_trader.build_news_momentum_signal(runtime, window_closes, window_highs, window_lows, window_volumes, event_snapshot)
             if breakout_signal and regime.allow_breakout:
                 setup_options.append(breakout_signal)
             if pullback_signal and regime.allow_pullback:
@@ -289,12 +303,20 @@ def simulate_strategy(df: pd.DataFrame, config: Optional[BacktestConfig] = None)
                 setup_options.append(compression_signal)
             if reversal_signal and regime.allow_trend:
                 setup_options.append(reversal_signal)
+            if event_signal is not None:
+                setup_options.append(event_signal)
             if setup_options:
                 signal = sorted(
                     setup_options,
-                    key=lambda item: crypto_trader.score_setup(item, trend_value, None, regime, 0.0, execution_quality, 1.0),
+                    key=lambda item: crypto_trader.score_setup(item, trend_value, event_snapshot, regime, 0.0, execution_quality, 1.0),
                     reverse=True,
                 )[0]
+                if event_snapshot is not None and not crypto_trader.sentiment_allows_entry(runtime, event_snapshot):
+                    signal = None
+                if signal is None:
+                    sym_state["prev_price"] = last
+                    equity_curve.append(cash + (qty * last))
+                    continue
                 qty_size = crypto_trader.size_for_risk(runtime, cash, signal.breakout_level, signal.stop, cash, 0.0)
                 qty_size *= signal.confidence * regime.risk_multiplier * execution_quality
                 fill_price = cost_adjusted_price(signal.breakout_level, config.fee_bps, config.slippage_bps, "buy")
@@ -318,6 +340,8 @@ def simulate_strategy(df: pd.DataFrame, config: Optional[BacktestConfig] = None)
                             "qty": qty,
                             "source": entry_source,
                             "regime": entry_regime,
+                            "twitter_score": None if event_snapshot is None else event_snapshot.primary_twitter_score,
+                            "confirmation_state": None if event_snapshot is None else event_snapshot.confirmation_state,
                         }
                     )
         else:
@@ -499,6 +523,7 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
             window_highs = highs[symbol][: idx + 1]
             window_lows = lows[symbol][: idx + 1]
             window_volumes = volumes[symbol][: idx + 1]
+            event_snapshot = active_event_snapshot(config.event_stream, symbol, index[idx].to_pydatetime(), runtime.twitter_event_max_age_minutes) if config.event_stream else None
             htf_closes = window_closes[-max(runtime.warmup_htf, runtime.htf_slow + runtime.htf_slope_n + 5) :]
             if len(htf_closes) < max(runtime.htf_slow + runtime.htf_slope_n, runtime.warmup_htf):
                 continue
@@ -507,7 +532,7 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
             atr_live = crypto_trader.atr(window_highs, window_lows, window_closes, runtime.atr_len)
             atr_pct_live = atr_live / max(window_closes[-1], 1e-9) if atr_live and atr_live == atr_live else 0.0
             vol_ratio_live = crypto_trader.volume_ratio(window_volumes, runtime.volume_window)
-            regime = crypto_trader.detect_regime(trend_ok, trend_value, atr_pct_live, vol_ratio_live, None)
+            regime = crypto_trader.detect_regime(trend_ok, trend_value, atr_pct_live, vol_ratio_live, event_snapshot)
             benchmark = closes["BTC/USD"][: idx + 1] if "BTC/USD" in closes and symbol != "BTC/USD" else None
             rel_strength = crypto_trader.relative_strength_score(window_closes, benchmark, runtime.rs_lookback)
             execution_quality = crypto_trader.estimate_execution_quality(symbol, atr_pct_live, vol_ratio_live)
@@ -516,6 +541,7 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
             pullback_signal = crypto_trader.build_pullback_entry_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             compression_signal = crypto_trader.build_compression_breakout_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             reversal_signal = crypto_trader.build_failed_breakdown_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
+            event_signal = crypto_trader.build_news_momentum_signal(runtime, window_closes, window_highs, window_lows, window_volumes, event_snapshot)
             if breakout_signal and regime.allow_breakout:
                 setup_options.append(breakout_signal)
             if pullback_signal and regime.allow_pullback:
@@ -524,14 +550,18 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                 setup_options.append(compression_signal)
             if reversal_signal and regime.allow_trend:
                 setup_options.append(reversal_signal)
+            if event_signal is not None:
+                setup_options.append(event_signal)
             if not setup_options or rel_strength < runtime.min_relative_strength or execution_quality < runtime.min_execution_quality:
+                continue
+            if event_snapshot is not None and not crypto_trader.sentiment_allows_entry(runtime, event_snapshot):
                 continue
             signal = sorted(
                 setup_options,
                 key=lambda item: crypto_trader.score_setup(
                     item,
                     trend_value,
-                    None,
+                    event_snapshot,
                     regime,
                     rel_strength,
                     execution_quality,
@@ -544,13 +574,13 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                     symbol=symbol,
                     signal=signal,
                     regime=regime,
-                    sentiment=None,
+                    sentiment=event_snapshot,
                     trend_score=trend_value,
                     sector=crypto_trader.sector_for_symbol(symbol),
                     score=crypto_trader.score_setup(
                         signal,
                         trend_value,
-                        None,
+                        event_snapshot,
                         regime,
                         rel_strength,
                         execution_quality,
@@ -590,6 +620,8 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                 "entry_ts": str(index[idx]),
                 "source": candidate.signal.source,
                 "regime": candidate.regime.name,
+                "twitter_score": None if candidate.sentiment is None else candidate.sentiment.primary_twitter_score,
+                "confirmation_state": None if candidate.sentiment is None else candidate.sentiment.confirmation_state,
             }
             sym_state = crypto_trader.get_sym_state(state, candidate.symbol)
             sym_state["tp1_hit"] = False

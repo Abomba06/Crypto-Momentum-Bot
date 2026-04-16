@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from app import backtest, crypto_trader
+from app.event_replay import ReplayEvent
 from app import sentiment
 
 
@@ -614,6 +615,40 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertIn("metrics", result)
         self.assertIn("ending_equity", result["metrics"])
         self.assertGreater(len(result["equity_curve"]), 0)
+
+    def test_backtest_can_replay_twitter_event_stream(self):
+        idx = pd.date_range("2024-01-01", periods=320, freq="D", tz="UTC")
+        closes = [100 + ((i % 5) * 0.12) + i * 0.08 for i in range(len(idx))]
+        df = pd.DataFrame(
+            {
+                "open": closes,
+                "high": [c + 1.0 for c in closes],
+                "low": [c - 0.9 for c in closes],
+                "close": closes,
+                "volume": [1000 + (i % 7) * 50 for i in range(len(idx))],
+            },
+            index=idx,
+        )
+        replay_start = max(backtest.BacktestConfig().warmup_ltf, backtest.BacktestConfig().warmup_htf)
+        event_stream = {
+            "SPY": [
+                ReplayEvent(
+                    timestamp=idx[replay_start + offset].to_pydatetime(),
+                    symbol="SPY",
+                    twitter_score=0.7,
+                    news_score=0.4,
+                    confirmation_state="confirmed_by_news",
+                    dominant_event_type="approval",
+                    acceleration=0.3,
+                    author="Replay Feed",
+                    text="Bullish approval event",
+                )
+                for offset in range(5)
+            ]
+        }
+        result = backtest.simulate_strategy(df, backtest.BacktestConfig(event_stream=event_stream))
+        self.assertIn("metrics", result)
+        self.assertTrue(any(trade.get("twitter_score") is not None for trade in result["trades"]))
 
     def test_walk_forward_validate_returns_summary(self):
         idx = pd.date_range("2023-01-01", periods=500, freq="D")
