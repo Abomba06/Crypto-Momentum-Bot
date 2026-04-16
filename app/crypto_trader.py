@@ -54,6 +54,20 @@ SPREAD_BPS_MAP = {
     "XRP/USD": 9.0,
 }
 
+LIQUIDITY_TIER_MAP = {
+    "BTC/USD": "liquid",
+    "ETH/USD": "liquid",
+    "SOL/USD": "standard",
+    "LTC/USD": "standard",
+    "LINK/USD": "standard",
+    "XRP/USD": "standard",
+    "AVAX/USD": "thin",
+    "ADA/USD": "thin",
+    "MATIC/USD": "thin",
+    "UNI/USD": "thin",
+    "DOGE/USD": "thin",
+}
+
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -155,6 +169,9 @@ class BotConfig:
     news_momentum_min_recent_items: int
     cross_asset_riskoff_penalty: float
     cross_asset_alt_strength_bonus: float
+    failed_order_cooldown_secs: int
+    max_order_retries: int
+    thin_liquidity_size_penalty: float
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -285,6 +302,9 @@ class BotConfig:
             news_momentum_min_recent_items=int(os.getenv("NEWS_MOMENTUM_MIN_RECENT_ITEMS", "2")),
             cross_asset_riskoff_penalty=float(os.getenv("CROSS_ASSET_RISKOFF_PENALTY", "0.72")),
             cross_asset_alt_strength_bonus=float(os.getenv("CROSS_ASSET_ALT_STRENGTH_BONUS", "0.08")),
+            failed_order_cooldown_secs=int(os.getenv("FAILED_ORDER_COOLDOWN_SECS", "300")),
+            max_order_retries=int(os.getenv("MAX_ORDER_RETRIES", "1")),
+            thin_liquidity_size_penalty=float(os.getenv("THIN_LIQUIDITY_SIZE_PENALTY", "0.86")),
         )
 
 
@@ -344,6 +364,7 @@ class CandidateSetup:
     execution_quality: float
     relative_strength: float
     cross_asset_multiplier: float
+    liquidity_tier: str
 
 
 @dataclass(frozen=True)
@@ -450,6 +471,43 @@ def write_signal_journal(
         )
 
 
+def submit_order_with_safeguards(
+    config: BotConfig,
+    broker: "AlpacaPaperBroker",
+    sym_state: Dict[str, Any],
+    symbol: str,
+    side: str,
+    qty: float,
+) -> Tuple[Optional[Order], float, Optional[str]]:
+    qty_attempt = max(0.0, qty)
+    tier = liquidity_tier(symbol)
+    max_attempts = max(1, config.max_order_retries + 1)
+    last_error: Optional[str] = None
+    for attempt in range(max_attempts):
+        try:
+            if side == "buy":
+                order = broker.submit_market_buy(symbol, qty_attempt)
+            else:
+                order = broker.submit_market_sell(symbol, qty_attempt)
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if attempt >= max_attempts - 1:
+                record_order_failure(config, sym_state, last_error)
+                return None, qty_attempt, last_error
+            if tier == "thin":
+                qty_attempt *= 0.90
+            elif tier == "standard":
+                qty_attempt *= 0.95
+            qty_attempt = round(max(0.0, qty_attempt), 8)
+            if qty_attempt <= 0:
+                record_order_failure(config, sym_state, last_error)
+                return None, qty_attempt, last_error
+            continue
+        clear_order_failure_state(sym_state)
+        return order, qty_attempt, None
+    return None, qty_attempt, last_error
+
+
 def print_dashboard(
     config: BotConfig,
     state: Dict[str, Any],
@@ -544,6 +602,9 @@ def print_dashboard(
             reason = snapshot.get("reason")
             if reason:
                 lines.append(f"    reason: {reason}")
+            order_error = snapshot.get("last_order_error")
+            if order_error:
+                lines.append(f"    order: {order_error[:120]}")
 
     sys.stdout.write("\n".join(lines) + "\n")
     sys.stdout.flush()
@@ -880,6 +941,9 @@ def get_sym_state(state: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         sym_state = {
             "prev_price": None,
             "last_fire_ts": None,
+            "order_block_until_ts": None,
+            "order_fail_count": 0,
+            "last_order_error": None,
             "tp1_hit": False,
             "warm_ltf_ok": False,
             "warm_htf_ok": False,
@@ -900,6 +964,9 @@ def reset_trade_state(sym_state: Dict[str, Any]) -> None:
 
 
 def can_fire(config: BotConfig, sym_state: Dict[str, Any]) -> bool:
+    blocked_until = sym_state.get("order_block_until_ts")
+    if blocked_until is not None and now_utc().timestamp() < float(blocked_until):
+        return False
     last = sym_state.get("last_fire_ts")
     if last is None:
         return True
@@ -908,6 +975,18 @@ def can_fire(config: BotConfig, sym_state: Dict[str, Any]) -> bool:
 
 def set_fired(sym_state: Dict[str, Any]) -> None:
     sym_state["last_fire_ts"] = now_utc().timestamp()
+
+
+def clear_order_failure_state(sym_state: Dict[str, Any]) -> None:
+    sym_state["order_block_until_ts"] = None
+    sym_state["order_fail_count"] = 0
+    sym_state["last_order_error"] = None
+
+
+def record_order_failure(config: BotConfig, sym_state: Dict[str, Any], message: str) -> None:
+    sym_state["order_fail_count"] = int(sym_state.get("order_fail_count", 0)) + 1
+    sym_state["last_order_error"] = message
+    sym_state["order_block_until_ts"] = now_utc().timestamp() + config.failed_order_cooldown_secs
 
 
 def total_notional(positions: Dict[str, BrokerPosition], prices: Dict[str, float]) -> float:
@@ -1005,6 +1084,19 @@ def compute_unrealized_pct(position: Optional[BrokerPosition], last: float) -> O
 
 def sector_for_symbol(symbol: str) -> str:
     return SECTOR_MAP.get(symbol, "other")
+
+
+def liquidity_tier(symbol: str) -> str:
+    return LIQUIDITY_TIER_MAP.get(symbol, "thin" if SPREAD_BPS_MAP.get(symbol, 12.0) >= 10.0 else "standard")
+
+
+def liquidity_size_multiplier(config: BotConfig, symbol: str) -> float:
+    tier = liquidity_tier(symbol)
+    if tier == "liquid":
+        return 1.0
+    if tier == "standard":
+        return 0.94
+    return max(0.60, min(0.98, config.thin_liquidity_size_penalty))
 
 
 def default_cross_asset_context() -> CrossAssetContext:
@@ -1141,6 +1233,7 @@ def update_symbol_snapshot(
         "regime": None if regime is None else regime.name,
         "relative_strength": relative_strength,
         "execution_quality": execution_quality,
+        "liquidity_tier": liquidity_tier(symbol),
         "cross_asset_regime": None if cross_asset is None else cross_asset.regime,
         "cross_asset_multiplier": 1.0 if cross_asset is None else cross_asset_multiplier(symbol, cross_asset),
         "sentiment_score": None if sentiment_snapshot is None else sentiment_snapshot.score,
@@ -1153,6 +1246,8 @@ def update_symbol_snapshot(
         "reason": "" if entry_signal is None else entry_signal.reason,
         "candidate_score": None,
         "last_action": last_action,
+        "order_fail_count": int(sym_state.get("order_fail_count", 0)),
+        "last_order_error": sym_state.get("last_order_error"),
         "updated_at": now_utc().isoformat(),
     }
 
@@ -1261,6 +1356,13 @@ def build_runtime_alerts(config: BotConfig, state: Dict[str, Any], report: Dict[
     cross_asset = meta.get("cross_asset", {})
     if cross_asset.get("regime") == "risk-off":
         alerts.append("Cross-asset context is risk-off.")
+    failed_symbols = [
+        symbol
+        for symbol, sym_state in state.get("sym", {}).items()
+        if int(sym_state.get("order_fail_count", 0)) > 0
+    ]
+    if failed_symbols:
+        alerts.append(f"Recent order failures: {', '.join(sorted(failed_symbols)[:3])}.")
 
     health = report.get("health", {})
     if health.get("status") == "degraded":
@@ -1354,7 +1456,8 @@ def estimate_execution_quality(symbol: str, atr_pct: float, vol_ratio: float) ->
     spread_penalty = min(0.25, spread_bps / 100.0)
     vol_bonus = 0.0 if not math.isfinite(vol_ratio) else min(0.18, max(-0.10, (vol_ratio - 1.0) * 0.18))
     atr_penalty = min(0.20, max(0.0, (atr_pct - 0.03) * 4.0))
-    quality = 0.92 - spread_penalty + vol_bonus - atr_penalty
+    tier_penalty = {"liquid": 0.0, "standard": 0.03, "thin": 0.08}.get(liquidity_tier(symbol), 0.05)
+    quality = 0.92 - spread_penalty + vol_bonus - atr_penalty - tier_penalty
     return max(0.35, min(1.0, quality))
 
 
@@ -1841,6 +1944,7 @@ def execute_ranked_entries(
                 * candidate.regime.risk_multiplier
                 * candidate.execution_quality
                 * candidate.cross_asset_multiplier
+                * liquidity_size_multiplier(config, symbol)
             )
         if buy_qty <= 0:
             set_snapshot_candidate_score(state, symbol, candidate.score)
@@ -1878,7 +1982,24 @@ def execute_ranked_entries(
             )
             continue
 
-        order = broker.submit_market_buy(symbol, buy_qty)
+        order, submitted_qty, error_message = submit_order_with_safeguards(config, broker, sym_state, symbol, "buy", buy_qty)
+        if order is None:
+            snapshot = state.get("sym", {}).get(symbol, {}).get("snapshot")
+            if snapshot is not None:
+                snapshot["last_action"] = "order failed"
+            write_signal_journal(
+                config,
+                symbol,
+                candidate.signal.source,
+                candidate.regime.name,
+                candidate.score,
+                None if candidate.sentiment is None else candidate.sentiment.score,
+                candidate.trend_score,
+                "rejected",
+                f"order_failed:{error_message or 'unknown'}",
+            )
+            log_line(config, f"{symbol} ENTRY failed: {error_message}")
+            continue
         sym_state["tp1_hit"] = False
         sym_state["high_water"] = candidate.last_price
         sym_state["last_entry_price"] = candidate.signal.breakout_level
@@ -1887,9 +2008,9 @@ def execute_ranked_entries(
         sym_state["live_stop"] = candidate.signal.stop
         set_fired(sym_state)
         entries_taken += 1
-        allocated += proposed_notional
-        heat_now += proposed_risk / max(account.equity, 1e-9)
-        sector_now[candidate.sector] = sector_now.get(candidate.sector, 0.0) + (proposed_notional / max(account.equity, 1e-9))
+        allocated += submitted_qty * candidate.signal.breakout_level
+        heat_now += (max(0.0, candidate.signal.breakout_level - candidate.signal.stop) * submitted_qty) / max(account.equity, 1e-9)
+        sector_now[candidate.sector] = sector_now.get(candidate.sector, 0.0) + ((submitted_qty * candidate.signal.breakout_level) / max(account.equity, 1e-9))
         state.setdefault("meta", {})["entries_this_loop"] = entries_taken
 
         note = (
@@ -1911,7 +2032,7 @@ def execute_ranked_entries(
             candidate.signal.stop,
             candidate.signal.tp1,
             candidate.signal.tp2,
-            buy_qty,
+            submitted_qty,
             note,
         )
         write_signal_journal(
@@ -2029,6 +2150,7 @@ def process_symbol(
     benchmark = btc_benchmark if symbol != "BTC/USD" else eth_benchmark
     rel_strength = relative_strength_score(closes, benchmark, config.rs_lookback)
     execution_quality = estimate_execution_quality(symbol, atr_pct_live, vol_ratio_live)
+    symbol_liquidity_tier = liquidity_tier(symbol)
     symbol_cross_asset_factor = cross_asset_multiplier(symbol, cross_asset) * cross_asset.risk_multiplier
     breakout_signal = build_entry_signal(config, closes, highs, lows, volumes)
     pullback_signal = build_pullback_entry_signal(config, closes, highs, lows, volumes)
@@ -2201,6 +2323,7 @@ def process_symbol(
                 execution_quality=execution_quality,
                 relative_strength=rel_strength,
                 cross_asset_multiplier=symbol_cross_asset_factor,
+                liquidity_tier=symbol_liquidity_tier,
             )
             set_snapshot_candidate_score(state, symbol, candidate_score)
             action_label = f"candidate {entry_signal.source}"
@@ -2247,25 +2370,29 @@ def process_symbol(
         sentiment_triggers_exit(config, sentiment_snapshot)
         or (sentiment_snapshot is not None and sentiment_snapshot.score <= config.shock_sentiment_threshold)
     ) and can_fire(config, sym_state) and qty_available > 0:
-        order = broker.submit_market_sell(symbol, qty_available)
-        set_fired(sym_state)
-        action_label = "sell sentiment"
-        pnl_value = (last - position.avg_entry_price) * qty_available
-        pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
-        update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct)
-        write_trade(
-            config,
-            symbol,
-            "EXIT_SENTIMENT_SUBMITTED",
-            last,
-            position.avg_entry_price,
-            stop,
-            tp1,
-            tp2,
-            qty_available,
-            f"order_id={order.id};sentiment={sentiment_snapshot.score:.3f};pnl_value={pnl_value:.4f};pnl_pct={pnl_pct:.3f}",
-        )
-        log_line(config, f"{symbol} bearish sentiment exit submitted qty={qty_available:.8f}")
+        order, submitted_qty, error_message = submit_order_with_safeguards(config, broker, sym_state, symbol, "sell", qty_available)
+        if order is None:
+            action_label = "exit failed"
+            log_line(config, f"{symbol} bearish sentiment exit failed: {error_message}")
+        else:
+            set_fired(sym_state)
+            action_label = "sell sentiment"
+            pnl_value = (last - position.avg_entry_price) * submitted_qty
+            pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
+            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct)
+            write_trade(
+                config,
+                symbol,
+                "EXIT_SENTIMENT_SUBMITTED",
+                last,
+                position.avg_entry_price,
+                stop,
+                tp1,
+                tp2,
+                submitted_qty,
+                f"order_id={order.id};sentiment={sentiment_snapshot.score:.3f};pnl_value={pnl_value:.4f};pnl_pct={pnl_pct:.3f}",
+            )
+            log_line(config, f"{symbol} bearish sentiment exit submitted qty={submitted_qty:.8f}")
 
     elif (
         not sym_state.get("tp1_hit", False)
@@ -2275,57 +2402,69 @@ def process_symbol(
     ):
         sell_qty = min(qty_available, qty * 0.4)
         if sell_qty > 0:
-            order = broker.submit_market_sell(symbol, sell_qty)
-            sym_state["tp1_hit"] = True
-            set_fired(sym_state)
-            action_label = "take profit 1"
-            pnl_value = (last - position.avg_entry_price) * sell_qty
-            pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
-            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct)
-            write_trade(config, symbol, "TP1_SUBMITTED", last, position.avg_entry_price, stop, tp1, tp2, sell_qty, f"order_id={order.id};pnl_value={pnl_value:.4f};pnl_pct={pnl_pct:.3f}")
-            log_line(config, f"{symbol} TP1 submitted qty={sell_qty:.8f}")
+            order, submitted_qty, error_message = submit_order_with_safeguards(config, broker, sym_state, symbol, "sell", sell_qty)
+            if order is None:
+                action_label = "tp1 failed"
+                log_line(config, f"{symbol} TP1 failed: {error_message}")
+            else:
+                sym_state["tp1_hit"] = True
+                set_fired(sym_state)
+                action_label = "take profit 1"
+                pnl_value = (last - position.avg_entry_price) * submitted_qty
+                pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
+                update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct)
+                write_trade(config, symbol, "TP1_SUBMITTED", last, position.avg_entry_price, stop, tp1, tp2, submitted_qty, f"order_id={order.id};pnl_value={pnl_value:.4f};pnl_pct={pnl_pct:.3f}")
+                log_line(config, f"{symbol} TP1 submitted qty={submitted_qty:.8f}")
 
     elif crossed_up(sym_state.get("prev_price"), last, tp2) and can_fire(config, sym_state) and qty_available > 0:
-        order = broker.submit_market_sell(symbol, qty_available)
-        set_fired(sym_state)
-        action_label = "take profit 2"
-        pnl_value = (last - position.avg_entry_price) * qty_available
-        pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
-        update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct)
-        write_trade(
-            config,
-            symbol,
-            "EXIT_TP2_SUBMITTED",
-            last,
-            position.avg_entry_price,
-            stop,
-            tp1,
-            tp2,
-            qty_available,
-            f"order_id={order.id};pnl_value={pnl_value:.4f};pnl_pct={pnl_pct:.3f}",
-        )
-        log_line(config, f"{symbol} TP2 exit submitted qty={qty_available:.8f}")
+        order, submitted_qty, error_message = submit_order_with_safeguards(config, broker, sym_state, symbol, "sell", qty_available)
+        if order is None:
+            action_label = "tp2 failed"
+            log_line(config, f"{symbol} TP2 failed: {error_message}")
+        else:
+            set_fired(sym_state)
+            action_label = "take profit 2"
+            pnl_value = (last - position.avg_entry_price) * submitted_qty
+            pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
+            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct)
+            write_trade(
+                config,
+                symbol,
+                "EXIT_TP2_SUBMITTED",
+                last,
+                position.avg_entry_price,
+                stop,
+                tp1,
+                tp2,
+                submitted_qty,
+                f"order_id={order.id};pnl_value={pnl_value:.4f};pnl_pct={pnl_pct:.3f}",
+            )
+            log_line(config, f"{symbol} TP2 exit submitted qty={submitted_qty:.8f}")
 
     elif crossed_down(sym_state.get("prev_price"), last, stop) and can_fire(config, sym_state) and qty_available > 0:
-        order = broker.submit_market_sell(symbol, qty_available)
-        set_fired(sym_state)
-        action_label = "stop exit"
-        pnl_value = (last - position.avg_entry_price) * qty_available
-        pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
-        update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct)
-        write_trade(
-            config,
-            symbol,
-            "EXIT_STOP_SUBMITTED",
-            last,
-            position.avg_entry_price,
-            stop,
-            tp1,
-            tp2,
-            qty_available,
-            f"order_id={order.id};pnl_value={pnl_value:.4f};pnl_pct={pnl_pct:.3f}",
-        )
-        log_line(config, f"{symbol} stop exit submitted qty={qty_available:.8f}")
+        order, submitted_qty, error_message = submit_order_with_safeguards(config, broker, sym_state, symbol, "sell", qty_available)
+        if order is None:
+            action_label = "stop failed"
+            log_line(config, f"{symbol} stop exit failed: {error_message}")
+        else:
+            set_fired(sym_state)
+            action_label = "stop exit"
+            pnl_value = (last - position.avg_entry_price) * submitted_qty
+            pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
+            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct)
+            write_trade(
+                config,
+                symbol,
+                "EXIT_STOP_SUBMITTED",
+                last,
+                position.avg_entry_price,
+                stop,
+                tp1,
+                tp2,
+                submitted_qty,
+                f"order_id={order.id};pnl_value={pnl_value:.4f};pnl_pct={pnl_pct:.3f}",
+            )
+            log_line(config, f"{symbol} stop exit submitted qty={submitted_qty:.8f}")
     else:
         action_label = "manage"
 

@@ -51,6 +51,9 @@ class BacktestConfig:
     news_momentum_min_recent_items: int = 2
     cross_asset_riskoff_penalty: float = 0.72
     cross_asset_alt_strength_bonus: float = 0.08
+    failed_order_cooldown_secs: int = 300
+    max_order_retries: int = 1
+    thin_liquidity_size_penalty: float = 0.86
 
     @property
     def warmup_ltf(self) -> int:
@@ -137,6 +140,9 @@ def as_runtime_config(config: BacktestConfig) -> Any:
         news_momentum_min_recent_items=config.news_momentum_min_recent_items,
         cross_asset_riskoff_penalty=config.cross_asset_riskoff_penalty,
         cross_asset_alt_strength_bonus=config.cross_asset_alt_strength_bonus,
+        failed_order_cooldown_secs=config.failed_order_cooldown_secs,
+        max_order_retries=config.max_order_retries,
+        thin_liquidity_size_penalty=config.thin_liquidity_size_penalty,
     )
 
 
@@ -194,6 +200,9 @@ def portfolio_runtime_config(config: BacktestConfig) -> Any:
     runtime.news_momentum_min_recent_items = config.news_momentum_min_recent_items
     runtime.cross_asset_riskoff_penalty = config.cross_asset_riskoff_penalty
     runtime.cross_asset_alt_strength_bonus = config.cross_asset_alt_strength_bonus
+    runtime.failed_order_cooldown_secs = config.failed_order_cooldown_secs
+    runtime.max_order_retries = config.max_order_retries
+    runtime.thin_liquidity_size_penalty = config.thin_liquidity_size_penalty
     return runtime
 
 
@@ -533,6 +542,7 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                     execution_quality=execution_quality,
                     relative_strength=rel_strength,
                     cross_asset_multiplier=crypto_trader.cross_asset_multiplier(symbol, cross_asset) * cross_asset.risk_multiplier,
+                    liquidity_tier=crypto_trader.liquidity_tier(symbol),
                 )
             )
 

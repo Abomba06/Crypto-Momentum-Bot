@@ -93,6 +93,9 @@ def make_config(case_name: str) -> crypto_trader.BotConfig:
         news_momentum_min_recent_items=2,
         cross_asset_riskoff_penalty=0.72,
         cross_asset_alt_strength_bonus=0.08,
+        failed_order_cooldown_secs=300,
+        max_order_retries=1,
+        thin_liquidity_size_penalty=0.86,
     )
 
 
@@ -130,6 +133,11 @@ class StrategySmokeTests(unittest.TestCase):
         sym_state = {"last_fire_ts": (crypto_trader.now_utc() - timedelta(seconds=60)).timestamp()}
         self.assertFalse(crypto_trader.can_fire(config, sym_state))
 
+    def test_can_fire_respects_failed_order_block(self):
+        config = make_config("order_block")
+        sym_state = {"order_block_until_ts": (crypto_trader.now_utc() + timedelta(seconds=120)).timestamp()}
+        self.assertFalse(crypto_trader.can_fire(config, sym_state))
+
     def test_build_sentiment_entry_signal_uses_atr_guardrails(self):
         config = make_config("sentiment_entry")
         closes = [100 + ((i % 4) * 0.15) + i * 0.03 for i in range(80)]
@@ -150,6 +158,28 @@ class StrategySmokeTests(unittest.TestCase):
         good = crypto_trader.estimate_execution_quality("BTC/USD", 0.01, 1.4)
         bad = crypto_trader.estimate_execution_quality("DOGE/USD", 0.06, 0.8)
         self.assertGreater(good, bad)
+
+    def test_submit_order_with_safeguards_blocks_after_retries_fail(self):
+        config = make_config("order_retry")
+        sym_state = crypto_trader.get_sym_state(crypto_trader.default_state(100000.0), "DOGE/USD")
+
+        class FailingBroker:
+            def submit_market_buy(self, symbol, qty):
+                raise RuntimeError("temporary venue issue")
+
+        order, attempted_qty, error = crypto_trader.submit_order_with_safeguards(
+            config,
+            FailingBroker(),
+            sym_state,
+            "DOGE/USD",
+            "buy",
+            10.0,
+        )
+        self.assertIsNone(order)
+        self.assertLess(attempted_qty, 10.0)
+        self.assertIn("temporary venue issue", error)
+        self.assertGreater(sym_state["order_fail_count"], 0)
+        self.assertIsNotNone(sym_state["order_block_until_ts"])
 
     def test_compute_cross_asset_context_detects_risk_on(self):
         config = make_config("cross_asset")
@@ -376,6 +406,7 @@ class StrategySmokeTests(unittest.TestCase):
             execution_quality=0.9,
             relative_strength=0.05,
             cross_asset_multiplier=1.04,
+            liquidity_tier="liquid",
         )
         crypto_trader.get_sym_state(state, "BTC/USD")["snapshot"] = {"symbol": "BTC/USD", "last_action": "watch"}
         broker = FakeBroker()
