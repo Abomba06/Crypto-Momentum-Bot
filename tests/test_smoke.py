@@ -309,6 +309,76 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertTrue(crypto_trader.sentiment_allows_entry(config, bullish))
         self.assertFalse(crypto_trader.sentiment_allows_entry(config, bearish))
 
+    def test_twitter_accelerate_mode_triggers_primary_entry(self):
+        config = make_config("twitter_accelerate")
+        config = crypto_trader.BotConfig(**{**config.__dict__, "sentiment_enabled": True, "twitter_primary_enabled": True, "twitter_primary_mode": "accelerate"})
+        snapshot = sentiment.SentimentSnapshot(
+            symbol="BTC/USD",
+            score=0.2,
+            label="bullish",
+            sample_size=3,
+            source_counts={"twitter": 2, "news": 1},
+            items=[],
+            top_headlines=["ETF tweet"],
+            event_counts={"approval": 1},
+            acceleration=0.2,
+            updated_at=crypto_trader.now_utc(),
+            top_twitter_posts=["ETF tweet"],
+            top_news_headlines=["Reuters confirm"],
+            primary_twitter_score=0.45,
+            news_confirmation_score=0.2,
+            confirmation_state="confirmed_by_news",
+            dominant_event_type="approval",
+        )
+        self.assertTrue(crypto_trader.sentiment_triggers_primary_entry(config, snapshot))
+
+    def test_twitter_event_score_adjustment_rewards_accelerate_mode(self):
+        config = make_config("twitter_score_adj")
+        config = crypto_trader.BotConfig(**{**config.__dict__, "twitter_primary_enabled": True, "twitter_primary_mode": "accelerate"})
+        signal = crypto_trader.EntrySignal(100.0, 95.0, 103.0, 106.0, 96.0, 2.0, 1.2, 60.0, "technical", 0.9, 0.02, 0.01, "breakout")
+        snapshot = sentiment.SentimentSnapshot(
+            symbol="BTC/USD",
+            score=0.25,
+            label="bullish",
+            sample_size=2,
+            source_counts={"twitter": 2},
+            items=[],
+            top_headlines=["ETF approval tweet"],
+            event_counts={"approval": 1},
+            acceleration=0.3,
+            updated_at=crypto_trader.now_utc(),
+            top_twitter_posts=["ETF approval tweet"],
+            top_news_headlines=[],
+            primary_twitter_score=0.55,
+            news_confirmation_score=0.0,
+            confirmation_state="unconfirmed",
+            dominant_event_type="approval",
+        )
+        self.assertGreater(crypto_trader.twitter_event_score_adjustment(config, snapshot, signal), 0.0)
+
+    def test_twitter_event_allows_entry_requires_confirmation_when_configured(self):
+        config = make_config("twitter_confirm_gate")
+        config = crypto_trader.BotConfig(**{**config.__dict__, "twitter_primary_enabled": True, "twitter_primary_mode": "confirm", "twitter_require_confirmation_for_entry": True})
+        snapshot = sentiment.SentimentSnapshot(
+            symbol="BTC/USD",
+            score=0.3,
+            label="bullish",
+            sample_size=1,
+            source_counts={"twitter": 1},
+            items=[],
+            top_headlines=["Unconfirmed tweet"],
+            event_counts={"approval": 1},
+            acceleration=0.2,
+            updated_at=crypto_trader.now_utc(),
+            top_twitter_posts=["Unconfirmed tweet"],
+            top_news_headlines=[],
+            primary_twitter_score=0.4,
+            news_confirmation_score=0.0,
+            confirmation_state="unconfirmed",
+            dominant_event_type="approval",
+        )
+        self.assertFalse(crypto_trader.twitter_event_allows_entry(config, snapshot, True))
+
     def test_sentiment_scoring_moves_with_headline_tone(self):
         self.assertGreater(sentiment.score_text("Bitcoin rally surge after approval"), 0.0)
         self.assertLess(sentiment.score_text("Bitcoin crash after lawsuit and hack"), 0.0)

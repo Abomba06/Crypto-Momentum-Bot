@@ -2179,6 +2179,52 @@ def score_setup(
     return base * regime.risk_multiplier * execution_quality * cross_asset_factor
 
 
+def twitter_event_score_adjustment(config: BotConfig, snapshot: Optional[SentimentSnapshot], signal: Optional[EntrySignal]) -> float:
+    if not config.twitter_primary_enabled or snapshot is None or signal is None:
+        return 0.0
+    if snapshot.primary_twitter_score < config.sentiment_buy_threshold:
+        return 0.0
+    mode = config.twitter_primary_mode
+    confirmation_bonus = {
+        "confirmed_by_news": 0.14,
+        "partially_confirmed": 0.08,
+        "unconfirmed": 0.03,
+    }.get(snapshot.confirmation_state, 0.0)
+    event_bonus = {
+        "approval": 0.08,
+        "etf": 0.08,
+        "listing": 0.07,
+        "partnership": 0.05,
+        "adoption": 0.05,
+        "hack": -0.12,
+        "exploit": -0.12,
+        "delisting": -0.10,
+        "lawsuit": -0.08,
+    }.get(snapshot.dominant_event_type, 0.0)
+    if mode == "accelerate":
+        return min(0.24, max(-0.20, (snapshot.primary_twitter_score * 0.18) + confirmation_bonus + event_bonus))
+    if mode == "confirm":
+        return min(0.12, max(-0.10, confirmation_bonus + (event_bonus * 0.5)))
+    return 0.0
+
+
+def twitter_event_allows_entry(config: BotConfig, snapshot: Optional[SentimentSnapshot], trend_ok: bool) -> bool:
+    if not config.twitter_primary_enabled:
+        return True
+    if snapshot is None:
+        return not config.twitter_require_confirmation_for_entry
+    mode = config.twitter_primary_mode
+    if mode == "confirm":
+        if snapshot.primary_twitter_score < config.sentiment_buy_threshold:
+            return False
+        if config.twitter_require_confirmation_for_entry:
+            return snapshot.confirmation_state in {"confirmed_by_news", "partially_confirmed"}
+        return trend_ok
+    if mode == "accelerate":
+        return snapshot.primary_twitter_score >= config.sentiment_buy_threshold
+    return True
+
+
 def sentiment_allows_entry(config: BotConfig, snapshot: Optional[SentimentSnapshot]) -> bool:
     if not config.sentiment_enabled or config.sentiment_mode == "disabled":
         return True
@@ -2193,9 +2239,9 @@ def sentiment_allows_entry(config: BotConfig, snapshot: Optional[SentimentSnapsh
 def sentiment_triggers_primary_entry(config: BotConfig, snapshot: Optional[SentimentSnapshot]) -> bool:
     return (
         config.sentiment_enabled
-        and config.sentiment_mode == "primary"
+        and (config.sentiment_mode == "primary" or (config.twitter_primary_enabled and config.twitter_primary_mode == "accelerate"))
         and snapshot is not None
-        and snapshot.score >= config.sentiment_buy_threshold
+        and max(snapshot.score, snapshot.primary_twitter_score) >= config.sentiment_buy_threshold
     )
 
 
@@ -2653,9 +2699,9 @@ def process_symbol(
                 action_label = "trend reject"
                 log_line(config, f"{symbol} HTF trend not OK; skip entry.")
             else:
-                action_label = "sentiment override"
+                action_label = "twitter accelerate" if config.twitter_primary_enabled else "sentiment override"
         else:
-            if not sentiment_allows_entry(config, sentiment_snapshot):
+            if not sentiment_allows_entry(config, sentiment_snapshot) or not twitter_event_allows_entry(config, sentiment_snapshot, trend_ok):
                 action_label = "sentiment reject"
                 update_symbol_snapshot(
                     state,
@@ -2719,6 +2765,7 @@ def process_symbol(
                 execution_quality,
                 symbol_cross_asset_factor,
             )
+            candidate_score += twitter_event_score_adjustment(config, sentiment_snapshot, entry_signal)
             candidate = CandidateSetup(
                 symbol=symbol,
                 signal=entry_signal,
