@@ -3,6 +3,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from app import backtest, crypto_trader
+from app import sentiment
 
 
 TEST_TMP_ROOT = Path("tests/.tmp")
@@ -53,6 +54,19 @@ def make_config(case_name: str) -> crypto_trader.BotConfig:
         trading_base_url="https://paper-api.alpaca.markets",
         default_exchange="",
         request_timeout_secs=20,
+        sentiment_enabled=False,
+        sentiment_mode="disabled",
+        sentiment_sources=["news"],
+        sentiment_lookback_hours=24,
+        sentiment_min_items=3,
+        sentiment_buy_threshold=0.15,
+        sentiment_sell_threshold=-0.15,
+        sentiment_cache_secs=300,
+        sentiment_exit_on_bearish=True,
+        sentiment_keyword_map={},
+        sentiment_news_limit=8,
+        sentiment_twitter_limit=8,
+        sentiment_twitter_rss_url="https://nitter.net/search/rss?f=tweets&q={query}",
     )
 
 
@@ -88,6 +102,45 @@ class StrategySmokeTests(unittest.TestCase):
         config = make_config("cooldown")
         sym_state = {"last_fire_ts": (crypto_trader.now_utc() - timedelta(seconds=60)).timestamp()}
         self.assertFalse(crypto_trader.can_fire(config, sym_state))
+
+    def test_build_sentiment_entry_signal_uses_atr_guardrails(self):
+        config = make_config("sentiment_entry")
+        closes = [100 + i * 0.25 for i in range(80)]
+        highs = [c + 1.0 for c in closes]
+        lows = [c - 0.9 for c in closes]
+        volumes = [100.0] * 80
+        signal = crypto_trader.build_sentiment_entry_signal(config, closes, highs, lows, volumes)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.source, "sentiment")
+        self.assertLess(signal.stop, signal.breakout_level)
+
+    def test_confirm_mode_requires_positive_sentiment(self):
+        config = make_config("confirm_mode")
+        config = crypto_trader.BotConfig(**{**config.__dict__, "sentiment_enabled": True, "sentiment_mode": "confirm"})
+        bullish = sentiment.SentimentSnapshot(
+            symbol="BTC/USD",
+            score=0.4,
+            label="bullish",
+            sample_size=5,
+            source_counts={"news": 5},
+            items=[],
+            updated_at=crypto_trader.now_utc(),
+        )
+        bearish = sentiment.SentimentSnapshot(
+            symbol="BTC/USD",
+            score=-0.4,
+            label="bearish",
+            sample_size=5,
+            source_counts={"news": 5},
+            items=[],
+            updated_at=crypto_trader.now_utc(),
+        )
+        self.assertTrue(crypto_trader.sentiment_allows_entry(config, bullish))
+        self.assertFalse(crypto_trader.sentiment_allows_entry(config, bearish))
+
+    def test_sentiment_scoring_moves_with_headline_tone(self):
+        self.assertGreater(sentiment.score_text("Bitcoin rally surge after approval"), 0.0)
+        self.assertLess(sentiment.score_text("Bitcoin crash after lawsuit and hack"), 0.0)
 
 
 if __name__ == "__main__":

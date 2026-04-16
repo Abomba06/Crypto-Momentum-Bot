@@ -20,6 +20,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.models import Order
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
+from app.sentiment import SentimentClient, SentimentSnapshot, parse_keyword_map
 
 
 load_dotenv()
@@ -88,6 +89,19 @@ class BotConfig:
     trading_base_url: str
     default_exchange: str
     request_timeout_secs: int
+    sentiment_enabled: bool
+    sentiment_mode: str
+    sentiment_sources: List[str]
+    sentiment_lookback_hours: int
+    sentiment_min_items: int
+    sentiment_buy_threshold: float
+    sentiment_sell_threshold: float
+    sentiment_cache_secs: int
+    sentiment_exit_on_bearish: bool
+    sentiment_keyword_map: Dict[str, List[str]]
+    sentiment_news_limit: int
+    sentiment_twitter_limit: int
+    sentiment_twitter_rss_url: str
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -173,6 +187,27 @@ class BotConfig:
             trading_base_url=os.getenv("APCA_API_BASE_URL", "").strip(),
             default_exchange=(os.getenv("ALPACA_CRYPTO_EXCHANGES") or "").strip(),
             request_timeout_secs=int(os.getenv("REQUEST_TIMEOUT_SECS", "20")),
+            sentiment_enabled=os.getenv("SENTIMENT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
+            sentiment_mode=os.getenv("SENTIMENT_MODE", "confirm").strip().lower(),
+            sentiment_sources=[
+                source.strip().lower()
+                for source in os.getenv("SENTIMENT_SOURCES", "news").split(",")
+                if source.strip()
+            ],
+            sentiment_lookback_hours=int(os.getenv("SENTIMENT_LOOKBACK_HOURS", "24")),
+            sentiment_min_items=int(os.getenv("SENTIMENT_MIN_ITEMS", "3")),
+            sentiment_buy_threshold=float(os.getenv("SENTIMENT_BUY_THRESHOLD", "0.15")),
+            sentiment_sell_threshold=float(os.getenv("SENTIMENT_SELL_THRESHOLD", "-0.15")),
+            sentiment_cache_secs=int(os.getenv("SENTIMENT_CACHE_SECS", "300")),
+            sentiment_exit_on_bearish=os.getenv("SENTIMENT_EXIT_ON_BEARISH", "true").strip().lower()
+            in {"1", "true", "yes", "on"},
+            sentiment_keyword_map=parse_keyword_map(os.getenv("SENTIMENT_KEYWORDS", "")),
+            sentiment_news_limit=int(os.getenv("SENTIMENT_NEWS_LIMIT", "8")),
+            sentiment_twitter_limit=int(os.getenv("SENTIMENT_TWITTER_LIMIT", "8")),
+            sentiment_twitter_rss_url=os.getenv(
+                "SENTIMENT_TWITTER_RSS_URL",
+                "https://nitter.net/search/rss?f=tweets&q={query}",
+            ).strip(),
         )
 
 
@@ -202,6 +237,7 @@ class EntrySignal:
     atr_value: float
     volume_ratio: float
     rsi_value: float
+    source: str
 
 
 def default_state(initial_cash: float) -> Dict[str, Any]:
@@ -739,6 +775,71 @@ def build_entry_signal(
         atr_value=atr_value,
         volume_ratio=vol_ratio,
         rsi_value=rsi_value,
+        source="technical",
+    )
+
+
+def build_sentiment_entry_signal(
+    config: BotConfig,
+    closes: List[float],
+    highs: List[float],
+    lows: List[float],
+    volumes: List[float],
+) -> Optional[EntrySignal]:
+    if len(closes) < config.warmup_ltf:
+        return None
+
+    atr_value = atr(highs, lows, closes, config.atr_len)
+    if not math.isfinite(atr_value) or atr_value <= 0:
+        return None
+
+    rsi_value = rsi(closes, config.rsi_len)
+    vol_ratio = volume_ratio(volumes, config.volume_window)
+    last = closes[-1]
+    atr_pct = atr_value / max(last, 1e-9)
+    if atr_pct < config.min_atr_pct:
+        return None
+
+    stop = last - config.stop_atr * atr_value
+    tp1 = last + config.tp1_atr * atr_value
+    tp2 = last + config.tp2_atr * atr_value
+    trail_anchor = last - config.trail_atr * atr_value
+    return EntrySignal(
+        breakout_level=last,
+        stop=stop,
+        tp1=tp1,
+        tp2=tp2,
+        trail_anchor=trail_anchor,
+        atr_value=atr_value,
+        volume_ratio=vol_ratio,
+        rsi_value=rsi_value,
+        source="sentiment",
+    )
+
+
+def sentiment_allows_entry(config: BotConfig, snapshot: Optional[SentimentSnapshot]) -> bool:
+    if not config.sentiment_enabled or config.sentiment_mode == "disabled":
+        return True
+    if config.sentiment_mode != "confirm":
+        return True
+    return snapshot is not None and snapshot.score >= config.sentiment_buy_threshold
+
+
+def sentiment_triggers_primary_entry(config: BotConfig, snapshot: Optional[SentimentSnapshot]) -> bool:
+    return (
+        config.sentiment_enabled
+        and config.sentiment_mode == "primary"
+        and snapshot is not None
+        and snapshot.score >= config.sentiment_buy_threshold
+    )
+
+
+def sentiment_triggers_exit(config: BotConfig, snapshot: Optional[SentimentSnapshot]) -> bool:
+    return (
+        config.sentiment_enabled
+        and config.sentiment_exit_on_bearish
+        and snapshot is not None
+        and snapshot.score <= config.sentiment_sell_threshold
     )
 
 
@@ -780,6 +881,7 @@ def process_symbol(
     config: BotConfig,
     data_client: AlpacaCryptoDataClient,
     broker: AlpacaPaperBroker,
+    sentiment_client: SentimentClient,
     state: Dict[str, Any],
     symbol: str,
     started_at: datetime,
@@ -816,6 +918,22 @@ def process_symbol(
     )
 
     entry_signal = build_entry_signal(config, closes, highs, lows, volumes)
+    sentiment_snapshot: Optional[SentimentSnapshot] = None
+    if sentiment_client.is_active():
+        try:
+            sentiment_snapshot = sentiment_client.get_sentiment(symbol, config.request_timeout_secs)
+        except Exception as exc:
+            log_line(config, f"{symbol} sentiment fetch failed: {type(exc).__name__}: {exc}")
+        else:
+            if sentiment_snapshot is None:
+                log_line(config, f"{symbol} sentiment unavailable or below minimum sample.")
+            else:
+                log_line(
+                    config,
+                    f"{symbol} sentiment={sentiment_snapshot.score:.3f} "
+                    f"label={sentiment_snapshot.label} samples={sentiment_snapshot.sample_size} "
+                    f"sources={sentiment_snapshot.source_counts}",
+                )
 
     if position is None or position.qty <= 0:
         reset_trade_state(sym_state)
@@ -832,11 +950,21 @@ def process_symbol(
         return
 
     if position is None or position.qty <= 0:
-        if not trend_ok:
-            log_line(config, f"{symbol} HTF trend not OK; skip entry.")
-        elif state.get("daily", {}).get("halt", False):
+        if state.get("daily", {}).get("halt", False):
             log_line(config, "Daily DD limit reached; entries halted.")
-        elif entry_signal and can_fire(config, sym_state):
+        elif not trend_ok:
+            if not sentiment_triggers_primary_entry(config, sentiment_snapshot):
+                log_line(config, f"{symbol} HTF trend not OK; skip entry.")
+        else:
+            if not sentiment_allows_entry(config, sentiment_snapshot):
+                log_line(config, f"{symbol} sentiment did not confirm long entry.")
+                sym_state["prev_price"] = last
+                return
+
+            if not entry_signal and sentiment_triggers_primary_entry(config, sentiment_snapshot):
+                entry_signal = build_sentiment_entry_signal(config, closes, highs, lows, volumes)
+
+        if entry_signal and can_fire(config, sym_state) and (trend_ok or entry_signal.source == "sentiment"):
             allocated = total_notional(positions, prices_now)
             buy_qty = size_for_risk(
                 config,
@@ -853,9 +981,11 @@ def process_symbol(
                 sym_state["last_entry_price"] = entry_signal.breakout_level
                 set_fired(sym_state)
                 note = (
-                    f"order_id={order.id};rsi={entry_signal.rsi_value:.2f};"
+                    f"order_id={order.id};source={entry_signal.source};rsi={entry_signal.rsi_value:.2f};"
                     f"vol_ratio={entry_signal.volume_ratio:.2f};atr={entry_signal.atr_value:.6f}"
                 )
+                if sentiment_snapshot is not None:
+                    note += f";sentiment={sentiment_snapshot.score:.3f}"
                 write_trade(
                     config,
                     symbol,
@@ -868,7 +998,7 @@ def process_symbol(
                     buy_qty,
                     note,
                 )
-                log_line(config, f"{symbol} ENTRY submitted qty={buy_qty:.8f}")
+                log_line(config, f"{symbol} ENTRY submitted qty={buy_qty:.8f} source={entry_signal.source}")
         else:
             log_line(config, f"{symbol} no valid breakout setup.")
 
@@ -879,7 +1009,24 @@ def process_symbol(
     qty = position.qty
     qty_available = position.qty_available
 
-    if (
+    if sentiment_triggers_exit(config, sentiment_snapshot) and can_fire(config, sym_state) and qty_available > 0:
+        order = broker.submit_market_sell(symbol, qty_available)
+        set_fired(sym_state)
+        write_trade(
+            config,
+            symbol,
+            "EXIT_SENTIMENT_SUBMITTED",
+            last,
+            position.avg_entry_price,
+            stop,
+            tp1,
+            tp2,
+            qty_available,
+            f"order_id={order.id};sentiment={sentiment_snapshot.score:.3f}",
+        )
+        log_line(config, f"{symbol} bearish sentiment exit submitted qty={qty_available:.8f}")
+
+    elif (
         not sym_state.get("tp1_hit", False)
         and crossed_up(sym_state.get("prev_price"), last, tp1)
         and can_fire(config, sym_state)
@@ -934,6 +1081,7 @@ def run_once(
     config: BotConfig,
     data_client: AlpacaCryptoDataClient,
     broker: AlpacaPaperBroker,
+    sentiment_client: SentimentClient,
     state: Dict[str, Any],
     symbols: List[str],
     started_at: datetime,
@@ -953,6 +1101,7 @@ def run_once(
                 config=config,
                 data_client=data_client,
                 broker=broker,
+                sentiment_client=sentiment_client,
                 state=state,
                 symbol=symbol,
                 started_at=started_at,
@@ -977,6 +1126,21 @@ def main() -> None:
     config = BotConfig.from_env()
     data_client = AlpacaCryptoDataClient(config)
     broker = AlpacaPaperBroker(config)
+    sentiment_client = SentimentClient(
+        build_session(),
+        enabled=config.sentiment_enabled,
+        mode=config.sentiment_mode,
+        sources=config.sentiment_sources,
+        lookback_hours=config.sentiment_lookback_hours,
+        min_items=config.sentiment_min_items,
+        bullish_threshold=config.sentiment_buy_threshold,
+        bearish_threshold=config.sentiment_sell_threshold,
+        cache_secs=config.sentiment_cache_secs,
+        keyword_map=config.sentiment_keyword_map,
+        news_limit=config.sentiment_news_limit,
+        twitter_limit=config.sentiment_twitter_limit,
+        twitter_rss_url=config.sentiment_twitter_rss_url,
+    )
     started_at = now_utc()
     state = load_state(config)
 
@@ -986,7 +1150,7 @@ def main() -> None:
     log_line(config, f"Active universe: {symbols}")
 
     while True:
-        run_once(config, data_client, broker, state, symbols, started_at)
+        run_once(config, data_client, broker, sentiment_client, state, symbols, started_at)
         time.sleep(config.loop_secs)
 
 
