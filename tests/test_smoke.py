@@ -301,6 +301,27 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertIn("trend", report["by_regime"])
         self.assertIn("BTC/USD", report["by_symbol"])
         self.assertIn("expectancy", report)
+        self.assertIn("health", report)
+
+    def test_build_research_report_flags_degraded_health_when_expectancy_is_negative(self):
+        state = crypto_trader.default_state(100000.0)
+        for _ in range(6):
+            crypto_trader.update_trade_stats(state, "BTC/USD", "technical", "trend", -40.0, -1.2)
+        report = crypto_trader.build_research_report(state)
+        self.assertEqual(report["health"]["status"], "degraded")
+        self.assertIn("negative_expectancy", report["health"]["flags"])
+
+    def test_build_runtime_alerts_surfaces_risk_conditions(self):
+        config = make_config("alerts")
+        state = crypto_trader.default_state(100000.0)
+        state["daily"]["halt"] = True
+        state["meta"]["consecutive_losses"] = config.max_consecutive_losses
+        state["meta"]["no_candidate_loops"] = 4
+        state["meta"]["cross_asset"] = {"regime": "risk-off"}
+        report = {"health": {"status": "degraded"}}
+        alerts = crypto_trader.build_runtime_alerts(config, state, report)
+        self.assertTrue(any("Daily drawdown halt" in item for item in alerts))
+        self.assertTrue(any("risk-off" in item for item in alerts))
 
     def test_execute_ranked_entries_respects_ranking_and_updates_state(self):
         config = make_config("execute_ranked")

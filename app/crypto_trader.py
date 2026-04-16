@@ -486,6 +486,9 @@ def print_dashboard(
             for item in top_candidates[:3]
         )
         lines.append(f"Top candidates: {top_line}")
+    alerts = state.get("meta", {}).get("alerts", [])
+    if alerts:
+        lines.append(f"Alerts: {' | '.join(str(item) for item in alerts[:3])}")
 
     active_positions = [position for position in positions.values() if position.qty > 0]
     if active_positions:
@@ -1200,6 +1203,73 @@ def summarize_bucket(records: List[Dict[str, Any]]) -> Dict[str, float]:
     }
 
 
+def build_parameter_health(
+    summary: Dict[str, float],
+    by_source: Dict[str, Dict[str, float]],
+    by_regime: Dict[str, Dict[str, float]],
+) -> Dict[str, Any]:
+    flags: List[str] = []
+    weak_sources = [
+        source
+        for source, bucket in by_source.items()
+        if int(bucket.get("count", 0)) >= 3 and safe_float(bucket.get("expectancy")) < 0
+    ]
+    weak_regimes = [
+        regime
+        for regime, bucket in by_regime.items()
+        if int(bucket.get("count", 0)) >= 3 and safe_float(bucket.get("expectancy")) < 0
+    ]
+
+    if int(summary.get("count", 0)) >= 6 and safe_float(summary.get("expectancy")) < 0:
+        flags.append("negative_expectancy")
+    if safe_float(summary.get("win_rate")) < 0.35 and int(summary.get("count", 0)) >= 6:
+        flags.append("low_win_rate")
+    if weak_sources:
+        flags.append("weak_sources")
+    if weak_regimes:
+        flags.append("weak_regimes")
+
+    status = "healthy"
+    if "negative_expectancy" in flags or "low_win_rate" in flags:
+        status = "degraded"
+    elif flags:
+        status = "watch"
+    return {
+        "status": status,
+        "flags": flags,
+        "weak_sources": weak_sources,
+        "weak_regimes": weak_regimes,
+    }
+
+
+def build_runtime_alerts(config: BotConfig, state: Dict[str, Any], report: Dict[str, Any]) -> List[str]:
+    alerts: List[str] = []
+    daily = state.get("daily", {})
+    weekly = state.get("weekly", {})
+    meta = state.get("meta", {})
+    if daily.get("halt", False):
+        alerts.append("Daily drawdown halt is active.")
+    if weekly.get("halt", False):
+        alerts.append("Weekly drawdown halt is active.")
+    if int(meta.get("consecutive_losses", 0)) >= max(1, config.max_consecutive_losses - 1):
+        alerts.append(f"Loss streak is elevated at {int(meta.get('consecutive_losses', 0))}.")
+    reconcile = meta.get("reconciliation", {})
+    if sum(int(reconcile.get(key, 0)) for key in ("restored", "cleared", "mismatched_qty")) > 0:
+        alerts.append("Broker reconciliation adjusted state this loop.")
+    if int(meta.get("no_candidate_loops", 0)) >= 3:
+        alerts.append(f"No ranked candidates for {int(meta.get('no_candidate_loops', 0))} loops.")
+    cross_asset = meta.get("cross_asset", {})
+    if cross_asset.get("regime") == "risk-off":
+        alerts.append("Cross-asset context is risk-off.")
+
+    health = report.get("health", {})
+    if health.get("status") == "degraded":
+        alerts.append("Research expectancy is degraded.")
+    elif health.get("status") == "watch":
+        alerts.append("Research health is on watch.")
+    return alerts[:6]
+
+
 def build_research_report(state: Dict[str, Any]) -> Dict[str, Any]:
     closed = state.get("stats", {}).get("closed", [])
     summary = summarize_bucket(closed)
@@ -1223,6 +1293,7 @@ def build_research_report(state: Dict[str, Any]) -> Dict[str, Any]:
     by_regime = {key: summarize_bucket(records) for key, records in by_regime_records.items()}
     by_symbol = {key: summarize_bucket(records) for key, records in by_symbol_records.items()}
     by_hour = {key: summarize_bucket(records) for key, records in by_hour_records.items()}
+    health = build_parameter_health(summary, by_source, by_regime)
     return {
         "generated_at": now_utc().isoformat(),
         "closed_trades": summary["count"],
@@ -1235,6 +1306,7 @@ def build_research_report(state: Dict[str, Any]) -> Dict[str, Any]:
         "by_regime": by_regime,
         "by_symbol": by_symbol,
         "by_hour": by_hour,
+        "health": health,
         "loss_streak": int(state.get("meta", {}).get("consecutive_losses", 0)),
         "reconciliation": state.get("meta", {}).get("reconciliation", {}),
     }
@@ -2345,6 +2417,7 @@ def run_once(
             log_line(config, f"{symbol} ERROR: {type(exc).__name__}: {exc}")
 
     meta["candidate_count"] = len(candidates)
+    meta["no_candidate_loops"] = 0 if candidates else int(meta.get("no_candidate_loops", 0)) + 1
     meta["top_candidates"] = [
         {
             "symbol": candidate.symbol,
@@ -2364,7 +2437,9 @@ def run_once(
     state["equity"] = account.equity
     meta["portfolio_heat"] = portfolio_heat(positions, state, prices_now, max(account.equity, 1e-9))
     meta["sector_exposure"] = sector_exposure(positions, prices_now, max(account.equity, 1e-9))
-    config.research_report.write_text(json.dumps(build_research_report(state), indent=2), encoding="utf-8")
+    report = build_research_report(state)
+    meta["alerts"] = build_runtime_alerts(config, state, report)
+    config.research_report.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print_dashboard(config, state, positions, open_order_symbols)
     save_state(config, state)
     log_line(config, f"Heartbeat: equity=${state['equity']:.2f}, cash=${state['cash']:.2f}")
