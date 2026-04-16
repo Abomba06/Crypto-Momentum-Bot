@@ -130,6 +130,10 @@ class BotConfig:
     min_atr_pct: float
     volume_window: int
     min_volume_ratio: float
+    bollinger_len: int
+    bollinger_std: float
+    mean_reversion_rsi_max: float
+    mean_reversion_band_buffer: float
     warmup_ltf: int
     warmup_htf: int
     mute_secs: int
@@ -285,6 +289,10 @@ class BotConfig:
             min_atr_pct=float(os.getenv("MIN_ATR_PCT", "0.0035")),
             volume_window=volume_window,
             min_volume_ratio=float(os.getenv("MIN_VOLUME_RATIO", "1.10")),
+            bollinger_len=int(os.getenv("BOLLINGER_LEN", "20")),
+            bollinger_std=float(os.getenv("BOLLINGER_STD", "2.0")),
+            mean_reversion_rsi_max=float(os.getenv("MEAN_REVERSION_RSI_MAX", "46")),
+            mean_reversion_band_buffer=float(os.getenv("MEAN_REVERSION_BAND_BUFFER", "0.15")),
             warmup_ltf=warmup_ltf,
             warmup_htf=warmup_htf,
             mute_secs=int(os.getenv("MUTE_SECS", "90")),
@@ -1064,6 +1072,15 @@ def sma(seq: List[float], n: int) -> float:
     if len(seq) < n:
         return float("nan")
     return sum(seq[-n:]) / float(n)
+
+
+def stddev(seq: List[float], n: int) -> float:
+    if len(seq) < n:
+        return float("nan")
+    window = seq[-n:]
+    mean = sum(window) / float(n)
+    variance = sum((value - mean) ** 2 for value in window) / float(n)
+    return math.sqrt(max(0.0, variance))
 
 
 def donchian(seq: List[float], n: int) -> Tuple[float, float]:
@@ -2184,6 +2201,60 @@ def build_sentiment_entry_signal(
     )
 
 
+def build_mean_reversion_signal(
+    config: BotConfig,
+    closes: List[float],
+    highs: List[float],
+    lows: List[float],
+    volumes: List[float],
+) -> Optional[EntrySignal]:
+    if len(closes) < max(config.warmup_ltf, config.bollinger_len + 2):
+        return None
+    atr_value = atr(highs, lows, closes, config.atr_len)
+    if not math.isfinite(atr_value) or atr_value <= 0:
+        return None
+    basis = sma(closes, config.bollinger_len)
+    band_std = stddev(closes, config.bollinger_len)
+    if not math.isfinite(basis) or not math.isfinite(band_std) or band_std <= 0:
+        return None
+    upper_band = basis + (config.bollinger_std * band_std)
+    lower_band = basis - (config.bollinger_std * band_std)
+    last = closes[-1]
+    prev = closes[-2]
+    rsi_value = rsi(closes, config.rsi_len)
+    vol_ratio = volume_ratio(volumes, config.volume_window)
+    atr_pct = atr_value / max(last, 1e-9)
+    if atr_pct < config.min_atr_pct * 0.8:
+        return None
+    if not math.isfinite(rsi_value) or rsi_value > config.mean_reversion_rsi_max:
+        return None
+    if prev < lower_band and last >= lower_band + (config.mean_reversion_band_buffer * atr_value):
+        stop = min(lows[-2:]) - (0.8 * atr_value)
+        tp1 = basis
+        tp2 = min(upper_band, last + (config.tp2_atr * atr_value))
+        recovery_pct = (last - lower_band) / max(atr_value, 1e-9)
+        confidence = 0.66
+        confidence += min(0.10, max(0.0, (config.mean_reversion_rsi_max - rsi_value) / 120.0))
+        confidence += min(0.10, max(0.0, recovery_pct * 0.08))
+        confidence += min(0.06, max(0.0, (1.1 - abs((last - basis) / max(band_std, 1e-9))) * 0.05))
+        return EntrySignal(
+            breakout_level=last,
+            stop=stop,
+            tp1=tp1,
+            tp2=tp2,
+            trail_anchor=last - config.trail_atr * atr_value,
+            atr_value=atr_value,
+            volume_ratio=vol_ratio,
+            rsi_value=rsi_value,
+            source="mean_reversion",
+            confidence=max(0.58, min(0.88, confidence)),
+            atr_pct=atr_pct,
+            ema_spread_pct=(basis - last) / max(last, 1e-9),
+            reason="bollinger_reclaim",
+        )
+    return None
+
+
 def build_news_momentum_signal(
     config: BotConfig,
     closes: List[float],
@@ -2441,6 +2512,7 @@ def score_setup(
         "sentiment": 0.08,
         "compression": 0.14,
         "reversal": 0.10,
+        "mean_reversion": 0.13,
         "news_momentum": 0.16,
     }.get(signal.source, 0.0)
     base = (
@@ -2455,6 +2527,8 @@ def score_setup(
         base += min(0.10, predicted_event_probability * 0.10)
     elif predicted_event_type in bearish_predicted_tags:
         base -= min(0.10, predicted_event_probability * 0.12)
+    if signal.source == "mean_reversion" and any(tag in regime.name for tag in ("chop", "range")):
+        base += 0.08
     return base * regime.risk_multiplier * execution_quality * cross_asset_factor
 
 
@@ -2902,6 +2976,7 @@ def process_symbol(
     pullback_signal = build_pullback_entry_signal(config, closes, highs, lows, volumes)
     compression_signal = build_compression_breakout_signal(config, closes, highs, lows, volumes)
     reversal_signal = build_failed_breakdown_signal(config, closes, highs, lows, volumes)
+    mean_reversion_signal = build_mean_reversion_signal(config, closes, highs, lows, volumes)
     entry_signal = breakout_signal
     sentiment_snapshot: Optional[SentimentSnapshot] = None
     if sentiment_client.is_active():
@@ -2982,6 +3057,8 @@ def process_symbol(
             setup_options.append(compression_signal)
         if reversal_signal and regime.allow_trend:
             setup_options.append(reversal_signal)
+        if mean_reversion_signal and any(tag in regime.name for tag in ("chop", "range")):
+            setup_options.append(mean_reversion_signal)
         news_momentum_signal = build_news_momentum_signal(config, closes, highs, lows, volumes, sentiment_snapshot)
         if news_momentum_signal and (trend_ok or sentiment_triggers_primary_entry(config, sentiment_snapshot)):
             setup_options.append(news_momentum_signal)

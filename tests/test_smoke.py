@@ -41,6 +41,10 @@ def make_config(case_name: str) -> crypto_trader.BotConfig:
         min_atr_pct=0.0035,
         volume_window=20,
         min_volume_ratio=1.1,
+        bollinger_len=20,
+        bollinger_std=2.0,
+        mean_reversion_rsi_max=46.0,
+        mean_reversion_band_buffer=0.15,
         warmup_ltf=70,
         warmup_htf=220,
         mute_secs=90,
@@ -386,6 +390,17 @@ class StrategySmokeTests(unittest.TestCase):
         config = make_config("slice_count")
         slices = crypto_trader.execution_slice_count(config, "ETH/USD", 80.0, 100.0, 0.68)
         self.assertGreaterEqual(slices, 2)
+
+    def test_mean_reversion_signal_can_trigger_on_bollinger_reclaim(self):
+        config = make_config("mean_reversion")
+        base = [100.0 + ((i % 3) - 1) * 0.2 for i in range(76)]
+        closes = base + [97.2, 98.9]
+        highs = [c + 0.8 for c in closes]
+        lows = [c - 0.8 for c in closes]
+        volumes = [1000.0 + (i % 4) * 35 for i in range(len(closes))]
+        signal = crypto_trader.build_mean_reversion_signal(config, closes, highs, lows, volumes)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.source, "mean_reversion")
 
     def test_failed_breakdown_signal_can_trigger(self):
         config = make_config("reversal")

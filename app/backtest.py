@@ -42,6 +42,10 @@ class BacktestConfig:
     min_atr_pct: float = 0.0035
     volume_window: int = 20
     min_volume_ratio: float = 1.05
+    bollinger_len: int = 20
+    bollinger_std: float = 2.0
+    mean_reversion_rsi_max: float = 46.0
+    mean_reversion_band_buffer: float = 0.15
     max_breakout_atr_extension: float = 0.8
     max_entry_rsi: float = 72.0
     ema_slope_lookback: int = 3
@@ -146,6 +150,10 @@ def as_runtime_config(config: BacktestConfig) -> Any:
         min_atr_pct=config.min_atr_pct,
         volume_window=config.volume_window,
         min_volume_ratio=config.min_volume_ratio,
+        bollinger_len=config.bollinger_len,
+        bollinger_std=config.bollinger_std,
+        mean_reversion_rsi_max=config.mean_reversion_rsi_max,
+        mean_reversion_band_buffer=config.mean_reversion_band_buffer,
         sentiment_enabled=bool(config.event_stream),
         sentiment_mode="confirm",
         sentiment_buy_threshold=0.15,
@@ -341,6 +349,7 @@ def simulate_strategy(df: pd.DataFrame, config: Optional[BacktestConfig] = None)
             pullback_signal = crypto_trader.build_pullback_entry_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             compression_signal = crypto_trader.build_compression_breakout_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             reversal_signal = crypto_trader.build_failed_breakdown_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
+            mean_reversion_signal = crypto_trader.build_mean_reversion_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             event_signal = crypto_trader.build_news_momentum_signal(runtime, window_closes, window_highs, window_lows, window_volumes, event_snapshot)
             if breakout_signal and regime.allow_breakout:
                 setup_options.append(breakout_signal)
@@ -350,6 +359,8 @@ def simulate_strategy(df: pd.DataFrame, config: Optional[BacktestConfig] = None)
                 setup_options.append(compression_signal)
             if reversal_signal and regime.allow_trend:
                 setup_options.append(reversal_signal)
+            if mean_reversion_signal and any(tag in regime.name for tag in ("chop", "range")):
+                setup_options.append(mean_reversion_signal)
             if event_signal is not None:
                 setup_options.append(event_signal)
             if not micro.allow_entry:
@@ -597,6 +608,7 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
             pullback_signal = crypto_trader.build_pullback_entry_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             compression_signal = crypto_trader.build_compression_breakout_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             reversal_signal = crypto_trader.build_failed_breakdown_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
+            mean_reversion_signal = crypto_trader.build_mean_reversion_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             event_signal = crypto_trader.build_news_momentum_signal(runtime, window_closes, window_highs, window_lows, window_volumes, event_snapshot)
             if breakout_signal and regime.allow_breakout:
                 setup_options.append(breakout_signal)
@@ -606,6 +618,8 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                 setup_options.append(compression_signal)
             if reversal_signal and regime.allow_trend:
                 setup_options.append(reversal_signal)
+            if mean_reversion_signal and any(tag in regime.name for tag in ("chop", "range")):
+                setup_options.append(mean_reversion_signal)
             if event_signal is not None:
                 setup_options.append(event_signal)
             if not micro.allow_entry:
