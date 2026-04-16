@@ -21,6 +21,7 @@ from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.models import Order
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 from app.sentiment import SentimentClient, SentimentSnapshot, parse_keyword_map
+from app.strategy import adaptive_regime_detector
 
 
 load_dotenv()
@@ -202,6 +203,16 @@ class BotConfig:
     max_theme_exposure: float
     correlation_penalty_same_sector: float
     correlation_penalty_same_theme: float
+    correlation_window: int
+    correlation_reduce_threshold: float
+    correlation_hard_limit: float
+    correlation_risk_floor: float
+    adaptive_regime_enabled: bool
+    adaptive_regime_lookback: int
+    volatility_targeting_enabled: bool
+    volatility_target_atr_pct: float
+    volatility_risk_floor: float
+    volatility_risk_cap: float
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -351,6 +362,16 @@ class BotConfig:
             max_theme_exposure=float(os.getenv("MAX_THEME_EXPOSURE", "0.28")),
             correlation_penalty_same_sector=float(os.getenv("CORRELATION_PENALTY_SAME_SECTOR", "0.88")),
             correlation_penalty_same_theme=float(os.getenv("CORRELATION_PENALTY_SAME_THEME", "0.78")),
+            correlation_window=int(os.getenv("CORRELATION_WINDOW", "30")),
+            correlation_reduce_threshold=float(os.getenv("CORRELATION_REDUCE_THRESHOLD", "0.72")),
+            correlation_hard_limit=float(os.getenv("CORRELATION_HARD_LIMIT", "0.88")),
+            correlation_risk_floor=float(os.getenv("CORRELATION_RISK_FLOOR", "0.58")),
+            adaptive_regime_enabled=os.getenv("ADAPTIVE_REGIME_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
+            adaptive_regime_lookback=int(os.getenv("ADAPTIVE_REGIME_LOOKBACK", "252")),
+            volatility_targeting_enabled=os.getenv("VOLATILITY_TARGETING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
+            volatility_target_atr_pct=float(os.getenv("VOLATILITY_TARGET_ATR_PCT", "0.02")),
+            volatility_risk_floor=float(os.getenv("VOLATILITY_RISK_FLOOR", "0.55")),
+            volatility_risk_cap=float(os.getenv("VOLATILITY_RISK_CAP", "1.35")),
         )
 
 
@@ -423,6 +444,24 @@ class CrossAssetContext:
     risk_multiplier: float
     majors_multiplier: float
     alts_multiplier: float
+
+
+@dataclass(frozen=True)
+class AdaptiveRegimeState:
+    name: str
+    trend_score: float
+    vol_score: float
+    risk_multiplier: float
+
+
+@dataclass(frozen=True)
+class CorrelationContext:
+    average_correlation: float
+    max_correlation: float
+    pair_count: int
+    risk_multiplier: float
+    heat_multiplier: float
+    is_clustered: bool
 
 
 def default_state(initial_cash: float) -> Dict[str, Any]:
@@ -624,6 +663,19 @@ def print_dashboard(
         lines.append(
             f"Cross-asset: {cross_asset.get('regime', 'neutral')} | BTC trend {safe_float(cross_asset.get('btc_trend_score')):+.2f} "
             f"| ETH trend {safe_float(cross_asset.get('eth_trend_score')):+.2f} | ETH/BTC RS {safe_float(cross_asset.get('eth_vs_btc')):+.3f}"
+        )
+    adaptive = state.get("meta", {}).get("adaptive_regime", {})
+    if adaptive:
+        lines.append(
+            f"Adaptive regime: {adaptive.get('name', 'n/a')} | trend {safe_float(adaptive.get('trend_score')):+.2f} "
+            f"| vol {safe_float(adaptive.get('vol_score')):.3f} | risk x{safe_float(adaptive.get('risk_multiplier'), 1.0):.2f}"
+        )
+    corr = state.get("meta", {}).get("correlation", {})
+    if corr:
+        lines.append(
+            f"Correlation: avg {safe_float(corr.get('avg')):.2f} | max {safe_float(corr.get('max')):.2f} "
+            f"| pairs {int(corr.get('pairs', 0))} | risk x{safe_float(corr.get('risk_multiplier'), 1.0):.2f} "
+            f"| heat x{safe_float(corr.get('heat_multiplier'), 1.0):.2f}"
         )
     reconcile = state.get("meta", {}).get("reconciliation", {})
     if reconcile:
@@ -1150,6 +1202,18 @@ def week_str() -> str:
     return f"{year}-W{week:02d}"
 
 
+def adaptive_regime_state(config: BotConfig, closes: List[float]) -> AdaptiveRegimeState:
+    if not config.adaptive_regime_enabled:
+        return AdaptiveRegimeState("disabled", 0.0, 0.0, 1.0)
+    result = adaptive_regime_detector(closes, config.adaptive_regime_lookback)
+    return AdaptiveRegimeState(
+        name=str(result.get("name", "transition")),
+        trend_score=safe_float(result.get("trend_score")),
+        vol_score=safe_float(result.get("vol_score")),
+        risk_multiplier=max(0.45, min(1.25, safe_float(result.get("risk_multiplier"), 1.0))),
+    )
+
+
 def init_weekly_controls(config: BotConfig, state: Dict[str, Any]) -> None:
     weekly = state.setdefault("weekly", {})
     if weekly.get("week") != week_str():
@@ -1171,7 +1235,12 @@ def update_loss_streak(state: Dict[str, Any], new_equity: float) -> None:
 def size_for_risk(config: BotConfig, cash: float, last: float, stop: float, equity: float, allocated_now: float) -> float:
     if not is_finite(last) or not is_finite(stop):
         return 0.0
-    risk_dollars = equity * config.risk_pct
+    atr_pct = abs(last - stop) / max(last, 1e-9)
+    vol_multiplier = 1.0
+    if config.volatility_targeting_enabled and atr_pct > 0:
+        vol_multiplier = config.volatility_target_atr_pct / max(atr_pct, 1e-9)
+        vol_multiplier = max(config.volatility_risk_floor, min(config.volatility_risk_cap, vol_multiplier))
+    risk_dollars = equity * config.risk_pct * vol_multiplier
     risk_per_unit = max(1e-9, last - stop)
     qty_risk_based = risk_dollars / risk_per_unit
 
@@ -1335,11 +1404,82 @@ def theme_exposure(positions: Dict[str, BrokerPosition], prices_now: Dict[str, f
     return exposures
 
 
+def trailing_returns(closes: List[float], window: int) -> List[float]:
+    if len(closes) < max(3, window + 1):
+        return []
+    series = closes[-(window + 1) :]
+    values: List[float] = []
+    for idx in range(1, len(series)):
+        prev = series[idx - 1]
+        now = series[idx]
+        if prev <= 0:
+            values.append(0.0)
+        else:
+            values.append((now / prev) - 1.0)
+    return values
+
+
+def pairwise_correlation(a: List[float], b: List[float]) -> float:
+    n = min(len(a), len(b))
+    if n < 3:
+        return 0.0
+    x = a[-n:]
+    y = b[-n:]
+    mean_x = sum(x) / n
+    mean_y = sum(y) / n
+    cov = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+    var_x = sum((xi - mean_x) ** 2 for xi in x)
+    var_y = sum((yi - mean_y) ** 2 for yi in y)
+    denom = math.sqrt(var_x * var_y)
+    if denom <= 1e-12:
+        return 0.0
+    return max(-1.0, min(1.0, cov / denom))
+
+
+def correlation_context(config: BotConfig, price_map: Dict[str, List[float]]) -> CorrelationContext:
+    series_map = {
+        symbol: trailing_returns(closes, config.correlation_window)
+        for symbol, closes in price_map.items()
+        if len(closes) >= config.correlation_window + 1
+    }
+    symbols = list(series_map)
+    correlations: List[float] = []
+    for idx, left in enumerate(symbols):
+        for right in symbols[idx + 1 :]:
+            corr = pairwise_correlation(series_map[left], series_map[right])
+            if math.isfinite(corr):
+                correlations.append(corr)
+    if not correlations:
+        return CorrelationContext(0.0, 0.0, 0, 1.0, 1.0, False)
+
+    positive = [value for value in correlations if value > 0]
+    avg_corr = sum(positive) / max(len(positive), 1)
+    max_corr = max(correlations)
+    if avg_corr <= config.correlation_reduce_threshold:
+        return CorrelationContext(avg_corr, max_corr, len(correlations), 1.0, 1.0, False)
+
+    excess = (avg_corr - config.correlation_reduce_threshold) / max(1e-9, 1.0 - config.correlation_reduce_threshold)
+    risk_multiplier = 1.0 - (0.42 * excess)
+    heat_multiplier = 1.0 - (0.30 * excess)
+    if max_corr >= config.correlation_hard_limit:
+        risk_multiplier *= 0.88
+        heat_multiplier *= 0.90
+    return CorrelationContext(
+        average_correlation=avg_corr,
+        max_correlation=max_corr,
+        pair_count=len(correlations),
+        risk_multiplier=max(config.correlation_risk_floor, min(1.0, risk_multiplier)),
+        heat_multiplier=max(config.correlation_risk_floor, min(1.0, heat_multiplier)),
+        is_clustered=True,
+    )
+
+
 def correlation_overlap_multiplier(
     config: BotConfig,
     candidate: CandidateSetup,
     existing_symbols: List[str],
     accepted_candidates: List[CandidateSetup],
+    price_map: Optional[Dict[str, List[float]]] = None,
 ) -> float:
     multiplier = 1.0
     for symbol in existing_symbols:
@@ -1347,6 +1487,14 @@ def correlation_overlap_multiplier(
             multiplier *= config.correlation_penalty_same_sector
         if theme_for_symbol(symbol) == candidate.theme:
             multiplier *= config.correlation_penalty_same_theme
+        if price_map and symbol in price_map and candidate.symbol in price_map:
+            corr = pairwise_correlation(
+                trailing_returns(price_map.get(candidate.symbol, []), config.correlation_window),
+                trailing_returns(price_map.get(symbol, []), config.correlation_window),
+            )
+            if corr >= config.correlation_reduce_threshold:
+                corr_excess = (corr - config.correlation_reduce_threshold) / max(1e-9, 1.0 - config.correlation_reduce_threshold)
+                multiplier *= max(config.correlation_risk_floor, 1.0 - (0.28 * corr_excess))
     for accepted in accepted_candidates:
         if accepted.symbol == candidate.symbol:
             continue
@@ -1354,6 +1502,14 @@ def correlation_overlap_multiplier(
             multiplier *= config.correlation_penalty_same_sector
         if accepted.theme == candidate.theme:
             multiplier *= config.correlation_penalty_same_theme
+        if price_map and accepted.symbol in price_map and candidate.symbol in price_map:
+            corr = pairwise_correlation(
+                trailing_returns(price_map.get(candidate.symbol, []), config.correlation_window),
+                trailing_returns(price_map.get(accepted.symbol, []), config.correlation_window),
+            )
+            if corr >= config.correlation_reduce_threshold:
+                corr_excess = (corr - config.correlation_reduce_threshold) / max(1e-9, 1.0 - config.correlation_reduce_threshold)
+                multiplier *= max(config.correlation_risk_floor, 1.0 - (0.28 * corr_excess))
     return max(0.45, min(1.0, multiplier))
 
 
@@ -1379,6 +1535,16 @@ def detect_regime(
     if trend_ok:
         return RegimeSnapshot("uptrend-lite", 0.80, True, True, False, 0.95)
     return RegimeSnapshot("risk-off", 0.25, False, False, False, 1.15)
+
+
+def blend_regime(base: RegimeSnapshot, adaptive: AdaptiveRegimeState) -> RegimeSnapshot:
+    risk_multiplier = base.risk_multiplier * adaptive.risk_multiplier
+    name = base.name if adaptive.name in {"disabled", "insufficient"} else f"{base.name}/{adaptive.name}"
+    allow_trend = base.allow_trend and adaptive.name != "bear_shock"
+    allow_pullback = base.allow_pullback and adaptive.name not in {"bear_shock"}
+    allow_breakout = base.allow_breakout and adaptive.name not in {"range", "bear_shock"}
+    exit_aggression = base.exit_aggression * (1.12 if adaptive.name == "bear_shock" else 1.0)
+    return RegimeSnapshot(name, max(0.0, min(1.25, risk_multiplier)), allow_trend, allow_pullback, allow_breakout, exit_aggression)
 
 
 def update_symbol_snapshot(
@@ -1635,6 +1801,11 @@ def build_runtime_alerts(config: BotConfig, state: Dict[str, Any], report: Dict[
     cross_asset = meta.get("cross_asset", {})
     if cross_asset.get("regime") == "risk-off":
         alerts.append("Cross-asset context is risk-off.")
+    corr = meta.get("correlation", {})
+    if bool(corr.get("clustered")):
+        alerts.append(
+            f"Correlation cluster detected (avg {safe_float(corr.get('avg')):.2f}, max {safe_float(corr.get('max')):.2f})."
+        )
     failed_symbols = [
         symbol
         for symbol, sym_state in state.get("sym", {}).items()
@@ -1952,15 +2123,19 @@ def build_news_momentum_signal(
     if snapshot.acceleration < config.news_momentum_min_acceleration:
         return None
 
-    now = now_utc()
+    reference_time = snapshot.updated_at
+    if reference_time is None:
+        dated_items = [item.published_at for item in snapshot.items if item.published_at is not None]
+        reference_time = max(dated_items) if dated_items else now_utc()
     recent_items = [
         item
         for item in snapshot.items
         if item.published_at is not None
-        and (now - item.published_at).total_seconds() <= config.news_momentum_max_age_hours * 3600
+        and 0 <= (reference_time - item.published_at).total_seconds() <= config.news_momentum_max_age_hours * 3600
     ]
-    if config.twitter_primary_enabled:
-        recent_items = [item for item in recent_items if item.source == "twitter"] or recent_items
+    twitter_recent_items = [item for item in recent_items if item.source == "twitter"]
+    if config.twitter_primary_enabled and snapshot.top_twitter_posts and not twitter_recent_items:
+        return None
     if len(recent_items) < config.news_momentum_min_recent_items:
         return None
 
@@ -1977,8 +2152,18 @@ def build_news_momentum_signal(
     if catalyst_count <= 0 and recent_weighted_score < config.sentiment_buy_threshold + 0.05:
         return None
 
-    base_signal = build_sentiment_entry_signal(config, closes, highs, lows, volumes)
-    if base_signal is None:
+    if len(closes) < config.warmup_ltf:
+        return None
+    atr_value = atr(highs, lows, closes, config.atr_len)
+    if not math.isfinite(atr_value) or atr_value <= 0:
+        return None
+    last = closes[-1]
+    atr_pct = atr_value / max(last, 1e-9)
+    if atr_pct < config.min_atr_pct:
+        return None
+    rsi_value = rsi(closes, config.rsi_len)
+    vol_ratio = volume_ratio(volumes, config.volume_window)
+    if math.isfinite(rsi_value) and rsi_value > (config.max_entry_rsi + 18.0) and catalyst_count <= 1:
         return None
 
     recent_share = len(recent_items) / max(snapshot.sample_size, 1)
@@ -1987,19 +2172,21 @@ def build_news_momentum_signal(
     confidence += min(0.08, max(0.0, snapshot.acceleration - config.news_momentum_min_acceleration) * 0.6)
     confidence += min(0.05, catalyst_count * 0.02)
     confidence += min(0.05, recent_share * 0.05)
+    if math.isfinite(rsi_value):
+        confidence -= min(0.08, max(0.0, rsi_value - config.max_entry_rsi) / 200.0)
     return EntrySignal(
-        breakout_level=base_signal.breakout_level,
-        stop=base_signal.stop,
-        tp1=base_signal.tp1,
-        tp2=base_signal.tp2,
-        trail_anchor=base_signal.trail_anchor,
-        atr_value=base_signal.atr_value,
-        volume_ratio=base_signal.volume_ratio,
-        rsi_value=base_signal.rsi_value,
+        breakout_level=last,
+        stop=last - config.stop_atr * atr_value,
+        tp1=last + config.tp1_atr * atr_value,
+        tp2=last + config.tp2_atr * atr_value,
+        trail_anchor=last - config.trail_atr * atr_value,
+        atr_value=atr_value,
+        volume_ratio=vol_ratio,
+        rsi_value=rsi_value,
         source="news_momentum",
         confidence=max(0.65, min(0.94, confidence)),
-        atr_pct=base_signal.atr_pct,
-        ema_spread_pct=base_signal.ema_spread_pct,
+        atr_pct=atr_pct,
+        ema_spread_pct=0.0,
         reason="fresh_news_catalyst",
     )
 
@@ -2329,6 +2516,7 @@ def execute_ranked_entries(
     prices_now: Dict[str, float],
     candidates: List[CandidateSetup],
     open_order_symbols: Set[str],
+    price_context: Optional[Dict[str, List[float]]] = None,
 ) -> None:
     if not candidates or not can_open_new_risk(config, state):
         return
@@ -2341,6 +2529,8 @@ def execute_ranked_entries(
     entries_taken = 0
     accepted_candidates: List[CandidateSetup] = []
     existing_symbols = [symbol for symbol, position in positions.items() if position.qty > 0]
+    corr_context = correlation_context(config, price_context or {})
+    effective_heat_cap = config.max_portfolio_heat * corr_context.heat_multiplier
 
     for candidate in ranked:
         if entries_taken >= config.max_entries_per_loop:
@@ -2364,7 +2554,7 @@ def execute_ranked_entries(
             allocated,
         )
         if buy_qty > 0:
-            overlap_multiplier = correlation_overlap_multiplier(config, candidate, existing_symbols, accepted_candidates)
+            overlap_multiplier = correlation_overlap_multiplier(config, candidate, existing_symbols, accepted_candidates, price_context)
             buy_qty *= (
                 candidate.signal.confidence
                 * candidate.regime.risk_multiplier
@@ -2372,6 +2562,7 @@ def execute_ranked_entries(
                 * candidate.cross_asset_multiplier
                 * liquidity_size_multiplier(config, symbol)
                 * overlap_multiplier
+                * corr_context.risk_multiplier
             )
         if buy_qty <= 0:
             set_snapshot_candidate_score(state, symbol, candidate.score)
@@ -2380,7 +2571,7 @@ def execute_ranked_entries(
 
         proposed_notional = buy_qty * candidate.signal.breakout_level
         proposed_risk = max(0.0, candidate.signal.breakout_level - candidate.signal.stop) * buy_qty
-        if heat_now + (proposed_risk / max(account.equity, 1e-9)) > config.max_portfolio_heat:
+        if heat_now + (proposed_risk / max(account.equity, 1e-9)) > effective_heat_cap:
             state["sym"][symbol]["snapshot"]["last_action"] = "heat cap"
             write_signal_journal(
                 config,
@@ -2566,7 +2757,10 @@ def process_symbol(
     position = positions.get(symbol)
     action_label = "watch"
 
-    htf_closes = data_client.fetch_htf_closes(symbol, max(config.warmup_htf, config.htf_slow + config.htf_slope_n + 5))
+    htf_closes = benchmark_context.get(symbol)
+    if not htf_closes:
+        htf_closes = data_client.fetch_htf_closes(symbol, max(config.warmup_htf, config.htf_slow + config.htf_slope_n + 5))
+        benchmark_context[symbol] = htf_closes
     if len(htf_closes) < max(config.htf_slow + config.htf_slope_n, config.warmup_htf):
         log_line(config, f"Not enough HTF bars for {symbol}")
         sym_state["warm_htf_ok"] = False
@@ -2586,6 +2780,7 @@ def process_symbol(
 
     trend_ok, htf_fast, htf_slow, htf_slope = compute_trend_ok(config, htf_closes)
     trend_value = trend_score(htf_fast, htf_slow, htf_slope, htf_closes[-1])
+    adaptive_state = adaptive_regime_state(config, htf_closes)
     log_line(
         config,
         f"HTF {symbol}: fast={round(htf_fast, 2)}, slow={round(htf_slow, 2)}, slope={round(htf_slope, 4)}, score={round(trend_value, 2)}",
@@ -2626,7 +2821,7 @@ def process_symbol(
                     f"events={sentiment_snapshot.event_counts}",
                 )
 
-    regime = detect_regime(trend_ok, trend_value, atr_pct_live, vol_ratio_live, sentiment_snapshot)
+    regime = blend_regime(detect_regime(trend_ok, trend_value, atr_pct_live, vol_ratio_live, sentiment_snapshot), adaptive_state)
 
     if position is None or position.qty <= 0:
         reset_trade_state(sym_state)
@@ -2976,21 +3171,38 @@ def run_once(
     prices_now: Dict[str, float] = {}
     candidates: List[CandidateSetup] = []
     benchmark_context: Dict[str, List[float]] = {}
-    for benchmark_symbol in ("BTC/USD", "ETH/USD"):
-        if benchmark_symbol in symbols:
-            try:
-                benchmark_context[benchmark_symbol] = data_client.fetch_htf_closes(
-                    benchmark_symbol,
-                    max(config.warmup_htf, config.htf_slow + config.htf_slope_n + 5),
-                )
-            except Exception as exc:
-                log_line(config, f"{benchmark_symbol} benchmark fetch failed: {type(exc).__name__}: {exc}")
+    for context_symbol in symbols:
+        try:
+            benchmark_context[context_symbol] = data_client.fetch_htf_closes(
+                context_symbol,
+                max(config.warmup_htf, config.htf_slow + config.htf_slope_n + 5, config.correlation_window + 5),
+            )
+        except Exception as exc:
+            if context_symbol in {"BTC/USD", "ETH/USD"}:
+                log_line(config, f"{context_symbol} benchmark fetch failed: {type(exc).__name__}: {exc}")
     cross_asset = compute_cross_asset_context(config, benchmark_context)
     meta["cross_asset"] = {
         "regime": cross_asset.regime,
         "btc_trend_score": round(cross_asset.btc_trend_score, 4),
         "eth_trend_score": round(cross_asset.eth_trend_score, 4),
         "eth_vs_btc": round(cross_asset.eth_vs_btc, 4),
+    }
+    btc_for_adaptive = benchmark_context.get("BTC/USD") or next(iter(benchmark_context.values()), [])
+    adaptive = adaptive_regime_state(config, btc_for_adaptive)
+    meta["adaptive_regime"] = {
+        "name": adaptive.name,
+        "trend_score": round(adaptive.trend_score, 4),
+        "vol_score": round(adaptive.vol_score, 4),
+        "risk_multiplier": round(adaptive.risk_multiplier, 4),
+    }
+    corr = correlation_context(config, benchmark_context)
+    meta["correlation"] = {
+        "avg": round(corr.average_correlation, 4),
+        "max": round(corr.max_correlation, 4),
+        "pairs": corr.pair_count,
+        "risk_multiplier": round(corr.risk_multiplier, 4),
+        "heat_multiplier": round(corr.heat_multiplier, 4),
+        "clustered": corr.is_clustered,
     }
     meta["portfolio_heat"] = portfolio_heat(positions, state, prices_now, account.equity)
     meta["sector_exposure"] = sector_exposure(positions, prices_now, account.equity)
@@ -3030,7 +3242,7 @@ def run_once(
         }
         for candidate in sorted(candidates, key=lambda item: item.score, reverse=True)[:5]
     ]
-    execute_ranked_entries(config, broker, state, account, positions, prices_now, candidates, open_order_symbols)
+    execute_ranked_entries(config, broker, state, account, positions, prices_now, candidates, open_order_symbols, benchmark_context)
 
     account = broker.get_account_snapshot()
     positions = broker.get_positions(symbols)

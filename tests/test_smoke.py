@@ -114,6 +114,16 @@ def make_config(case_name: str) -> crypto_trader.BotConfig:
         max_theme_exposure=0.28,
         correlation_penalty_same_sector=0.88,
         correlation_penalty_same_theme=0.78,
+        correlation_window=30,
+        correlation_reduce_threshold=0.72,
+        correlation_hard_limit=0.88,
+        correlation_risk_floor=0.58,
+        adaptive_regime_enabled=True,
+        adaptive_regime_lookback=252,
+        volatility_targeting_enabled=True,
+        volatility_target_atr_pct=0.02,
+        volatility_risk_floor=0.55,
+        volatility_risk_cap=1.35,
     )
 
 
@@ -231,6 +241,70 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertEqual(context.regime, "risk-on")
         self.assertGreater(context.alts_multiplier, 1.0)
 
+    def test_adaptive_regime_state_detects_bull_trend(self):
+        config = make_config("adaptive_regime")
+        closes = [100 + i * 0.35 for i in range(280)]
+        state = crypto_trader.adaptive_regime_state(config, closes)
+        self.assertIn(state.name, {"bull_trend", "transition", "range"})
+        self.assertGreater(state.risk_multiplier, 0.0)
+
+    def test_size_for_risk_scales_down_when_atr_is_large(self):
+        config = make_config("vol_target")
+        config = crypto_trader.BotConfig(**{**config.__dict__, "per_coin_cap": 50000.0})
+        high_vol_qty = crypto_trader.size_for_risk(config, 100000.0, 100.0, 90.0, 100000.0, 0.0)
+        low_vol_qty = crypto_trader.size_for_risk(config, 100000.0, 100.0, 98.0, 100000.0, 0.0)
+        self.assertLess(high_vol_qty, low_vol_qty)
+
+    def test_news_momentum_signal_can_form_from_fresh_twitter_catalyst(self):
+        config = make_config("news_momentum_signal")
+        closes = [100 + ((i % 4) * 0.08) + i * 0.10 for i in range(config.warmup_ltf + 8)]
+        highs = [c + 1.0 for c in closes]
+        lows = [c - 0.9 for c in closes]
+        volumes = [1000 + (i % 5) * 70 for i in range(len(closes))]
+        ts = crypto_trader.now_utc()
+        snapshot = sentiment.SentimentSnapshot(
+            symbol="BTC/USD",
+            score=0.64,
+            label="bullish",
+            sample_size=2,
+            source_counts={"twitter": 1, "news": 1},
+            items=[
+                sentiment.SentimentItem(
+                    source="twitter",
+                    source_name="tester",
+                    title="ETF approval momentum",
+                    published_at=ts,
+                    score=0.7,
+                    weight=1.2,
+                    relevance=1.0,
+                    event_tags=["approval", "etf"],
+                ),
+                sentiment.SentimentItem(
+                    source="news",
+                    source_name="tester-news",
+                    title="ETF approval confirmation",
+                    published_at=ts,
+                    score=0.4,
+                    weight=1.0,
+                    relevance=1.0,
+                    event_tags=["approval", "etf"],
+                ),
+            ],
+            top_headlines=["ETF approval momentum"],
+            event_counts={"approval": 2, "etf": 2},
+            acceleration=0.28,
+            updated_at=ts,
+            top_twitter_posts=["ETF approval momentum"],
+            top_news_headlines=["ETF approval confirmation"],
+            primary_twitter_score=0.7,
+            news_confirmation_score=0.4,
+            confirmation_state="confirmed_by_news",
+            dominant_event_type="approval",
+        )
+        signal = crypto_trader.build_news_momentum_signal(config, closes, highs, lows, volumes, snapshot)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.source, "news_momentum")
+
     def test_theme_exposure_groups_symbols_by_narrative(self):
         prices_now = {"SOL/USD": 100.0, "AVAX/USD": 50.0}
         positions = {
@@ -240,6 +314,58 @@ class StrategySmokeTests(unittest.TestCase):
         exposure = crypto_trader.theme_exposure(positions, prices_now, 1000.0)
         self.assertIn("high-beta-layer1", exposure)
         self.assertAlmostEqual(exposure["high-beta-layer1"], 0.2, places=6)
+
+    def test_correlation_context_reduces_risk_for_clustered_book(self):
+        config = make_config("correlation_context")
+        price_map = {
+            "BTC/USD": [100 + i * 0.4 for i in range(40)],
+            "ETH/USD": [110 + i * 0.44 for i in range(40)],
+            "SOL/USD": [90 + i * 0.36 for i in range(40)],
+        }
+        context = crypto_trader.correlation_context(config, price_map)
+        self.assertTrue(context.is_clustered)
+        self.assertLess(context.risk_multiplier, 1.0)
+
+    def test_correlation_overlap_multiplier_penalizes_high_corr_candidate(self):
+        config = make_config("correlation_overlap")
+        candidate = crypto_trader.CandidateSetup(
+            symbol="ETH/USD",
+            signal=crypto_trader.EntrySignal(100.0, 96.0, 104.0, 108.0, 95.0, 2.0, 1.1, 62.0, "technical", 0.8, 0.02, 0.01, "test"),
+            regime=crypto_trader.RegimeSnapshot("trend", 1.0, True, True, True, 1.0),
+            sentiment=None,
+            trend_score=1.5,
+            sector="majors",
+            score=1.0,
+            last_price=100.0,
+            execution_quality=0.9,
+            relative_strength=0.1,
+            cross_asset_multiplier=1.0,
+            liquidity_tier="liquid",
+            theme="smart-contracts",
+        )
+        accepted = [
+            crypto_trader.CandidateSetup(
+                symbol="BTC/USD",
+                signal=candidate.signal,
+                regime=candidate.regime,
+                sentiment=None,
+                trend_score=1.4,
+                sector="majors",
+                score=0.9,
+                last_price=100.0,
+                execution_quality=0.9,
+                relative_strength=0.08,
+                cross_asset_multiplier=1.0,
+                liquidity_tier="liquid",
+                theme="store-of-value",
+            )
+        ]
+        price_map = {
+            "BTC/USD": [100 + i * 0.5 for i in range(40)],
+            "ETH/USD": [120 + i * 0.51 for i in range(40)],
+        }
+        multiplier = crypto_trader.correlation_overlap_multiplier(config, candidate, ["BTC/USD"], accepted, price_map)
+        self.assertLess(multiplier, 1.0)
 
     def test_failed_breakdown_signal_can_trigger(self):
         config = make_config("reversal")
@@ -745,7 +871,10 @@ class StrategySmokeTests(unittest.TestCase):
                 for offset in range(5)
             ]
         }
-        result = backtest.simulate_strategy(df, backtest.BacktestConfig(event_stream=event_stream))
+        result = backtest.simulate_strategy(
+            df,
+            backtest.BacktestConfig(event_stream=event_stream, news_momentum_min_recent_items=1),
+        )
         self.assertIn("metrics", result)
         self.assertTrue(any(trade.get("twitter_score") is not None for trade in result["trades"]))
 

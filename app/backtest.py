@@ -62,7 +62,17 @@ class BacktestConfig:
     max_theme_exposure: float = 0.28
     correlation_penalty_same_sector: float = 0.88
     correlation_penalty_same_theme: float = 0.78
+    correlation_window: int = 30
+    correlation_reduce_threshold: float = 0.72
+    correlation_hard_limit: float = 0.88
+    correlation_risk_floor: float = 0.58
     event_stream: Dict[str, List[ReplayEvent]] = field(default_factory=dict)
+    adaptive_regime_enabled: bool = True
+    adaptive_regime_lookback: int = 252
+    volatility_targeting_enabled: bool = True
+    volatility_target_atr_pct: float = 0.02
+    volatility_risk_floor: float = 0.55
+    volatility_risk_cap: float = 1.35
 
     @property
     def warmup_ltf(self) -> int:
@@ -162,11 +172,21 @@ def as_runtime_config(config: BacktestConfig) -> Any:
         max_theme_exposure=config.max_theme_exposure,
         correlation_penalty_same_sector=config.correlation_penalty_same_sector,
         correlation_penalty_same_theme=config.correlation_penalty_same_theme,
+        correlation_window=config.correlation_window,
+        correlation_reduce_threshold=config.correlation_reduce_threshold,
+        correlation_hard_limit=config.correlation_hard_limit,
+        correlation_risk_floor=config.correlation_risk_floor,
         twitter_primary_enabled=bool(config.event_stream),
         twitter_primary_mode="accelerate",
         twitter_event_max_age_minutes=120,
         twitter_require_confirmation_for_entry=False,
         twitter_allow_exit_interrupt=True,
+        adaptive_regime_enabled=config.adaptive_regime_enabled,
+        adaptive_regime_lookback=config.adaptive_regime_lookback,
+        volatility_targeting_enabled=config.volatility_targeting_enabled,
+        volatility_target_atr_pct=config.volatility_target_atr_pct,
+        volatility_risk_floor=config.volatility_risk_floor,
+        volatility_risk_cap=config.volatility_risk_cap,
     )
 
 
@@ -233,6 +253,16 @@ def portfolio_runtime_config(config: BacktestConfig) -> Any:
     runtime.max_theme_exposure = config.max_theme_exposure
     runtime.correlation_penalty_same_sector = config.correlation_penalty_same_sector
     runtime.correlation_penalty_same_theme = config.correlation_penalty_same_theme
+    runtime.correlation_window = config.correlation_window
+    runtime.correlation_reduce_threshold = config.correlation_reduce_threshold
+    runtime.correlation_hard_limit = config.correlation_hard_limit
+    runtime.correlation_risk_floor = config.correlation_risk_floor
+    runtime.adaptive_regime_enabled = config.adaptive_regime_enabled
+    runtime.adaptive_regime_lookback = config.adaptive_regime_lookback
+    runtime.volatility_targeting_enabled = config.volatility_targeting_enabled
+    runtime.volatility_target_atr_pct = config.volatility_target_atr_pct
+    runtime.volatility_risk_floor = config.volatility_risk_floor
+    runtime.volatility_risk_cap = config.volatility_risk_cap
     return runtime
 
 
@@ -285,7 +315,11 @@ def simulate_strategy(df: pd.DataFrame, config: Optional[BacktestConfig] = None)
         atr_live = crypto_trader.atr(window_highs, window_lows, window_closes, runtime.atr_len)
         atr_pct_live = atr_live / max(last, 1e-9) if atr_live and atr_live == atr_live else 0.0
         vol_ratio_live = crypto_trader.volume_ratio(window_volumes, runtime.volume_window)
-        regime = crypto_trader.detect_regime(trend_ok, trend_value, atr_pct_live, vol_ratio_live, event_snapshot)
+        adaptive_state = crypto_trader.adaptive_regime_state(runtime, htf_closes)
+        regime = crypto_trader.blend_regime(
+            crypto_trader.detect_regime(trend_ok, trend_value, atr_pct_live, vol_ratio_live, event_snapshot),
+            adaptive_state,
+        )
         execution_quality = crypto_trader.estimate_execution_quality(config.symbol, atr_pct_live, vol_ratio_live)
 
         if qty <= 0:
@@ -516,6 +550,8 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
         candidates: List[crypto_trader.CandidateSetup] = []
         allocated_now = sum(pos["qty"] * prices_now[symbol] for symbol, pos in positions.items())
         account_equity = cash + sum(pos["qty"] * prices_now[symbol] for symbol, pos in positions.items())
+        price_context = {symbol: closes[symbol][: idx + 1] for symbol in symbols}
+        corr_context = crypto_trader.correlation_context(runtime, price_context)
         for symbol in symbols:
             if symbol in positions:
                 continue
@@ -532,7 +568,11 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
             atr_live = crypto_trader.atr(window_highs, window_lows, window_closes, runtime.atr_len)
             atr_pct_live = atr_live / max(window_closes[-1], 1e-9) if atr_live and atr_live == atr_live else 0.0
             vol_ratio_live = crypto_trader.volume_ratio(window_volumes, runtime.volume_window)
-            regime = crypto_trader.detect_regime(trend_ok, trend_value, atr_pct_live, vol_ratio_live, event_snapshot)
+            adaptive_state = crypto_trader.adaptive_regime_state(runtime, htf_closes)
+            regime = crypto_trader.blend_regime(
+                crypto_trader.detect_regime(trend_ok, trend_value, atr_pct_live, vol_ratio_live, event_snapshot),
+                adaptive_state,
+            )
             benchmark = closes["BTC/USD"][: idx + 1] if "BTC/USD" in closes and symbol != "BTC/USD" else None
             rel_strength = crypto_trader.relative_strength_score(window_closes, benchmark, runtime.rs_lookback)
             execution_quality = crypto_trader.estimate_execution_quality(symbol, atr_pct_live, vol_ratio_live)
@@ -609,6 +649,7 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                 * candidate.regime.risk_multiplier
                 * candidate.execution_quality
                 * candidate.cross_asset_multiplier
+                * corr_context.risk_multiplier
             )
             fill_price = cost_adjusted_price(candidate.signal.breakout_level, config.fee_bps, config.slippage_bps, "buy")
             notional = qty_size * fill_price
