@@ -46,6 +46,11 @@ class BacktestConfig:
     pullback_ema_buffer_atr: float = 0.35
     trend_mode: str = "loose"
     max_entries_per_bar: int = 2
+    news_momentum_min_acceleration: float = 0.12
+    news_momentum_max_age_hours: int = 6
+    news_momentum_min_recent_items: int = 2
+    cross_asset_riskoff_penalty: float = 0.72
+    cross_asset_alt_strength_bonus: float = 0.08
 
     @property
     def warmup_ltf(self) -> int:
@@ -127,6 +132,11 @@ def as_runtime_config(config: BacktestConfig) -> Any:
         rs_lookback=20,
         min_relative_strength=-0.02,
         min_execution_quality=0.55,
+        news_momentum_min_acceleration=config.news_momentum_min_acceleration,
+        news_momentum_max_age_hours=config.news_momentum_max_age_hours,
+        news_momentum_min_recent_items=config.news_momentum_min_recent_items,
+        cross_asset_riskoff_penalty=config.cross_asset_riskoff_penalty,
+        cross_asset_alt_strength_bonus=config.cross_asset_alt_strength_bonus,
     )
 
 
@@ -179,6 +189,11 @@ def portfolio_runtime_config(config: BacktestConfig) -> Any:
     runtime.compression_atr_ratio = 0.85
     runtime.reversal_lookback = 10
     runtime.min_execution_quality = 0.55
+    runtime.news_momentum_min_acceleration = config.news_momentum_min_acceleration
+    runtime.news_momentum_max_age_hours = config.news_momentum_max_age_hours
+    runtime.news_momentum_min_recent_items = config.news_momentum_min_recent_items
+    runtime.cross_asset_riskoff_penalty = config.cross_asset_riskoff_penalty
+    runtime.cross_asset_alt_strength_bonus = config.cross_asset_alt_strength_bonus
     return runtime
 
 
@@ -250,7 +265,7 @@ def simulate_strategy(df: pd.DataFrame, config: Optional[BacktestConfig] = None)
             if setup_options:
                 signal = sorted(
                     setup_options,
-                    key=lambda item: crypto_trader.score_setup(item, trend_value, None, regime, 0.0, execution_quality),
+                    key=lambda item: crypto_trader.score_setup(item, trend_value, None, regime, 0.0, execution_quality, 1.0),
                     reverse=True,
                 )[0]
                 qty_size = crypto_trader.size_for_risk(runtime, cash, signal.breakout_level, signal.stop, cash, 0.0)
@@ -376,6 +391,12 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
 
     for idx in range(start_idx, len(index)):
         prices_now = {symbol: closes[symbol][idx] for symbol in symbols}
+        benchmark_context = {
+            symbol: closes[symbol][: idx + 1]
+            for symbol in ("BTC/USD", "ETH/USD")
+            if symbol in closes
+        }
+        cross_asset = crypto_trader.compute_cross_asset_context(runtime, benchmark_context)
 
         for symbol in list(positions.keys()):
             window_closes = closes[symbol][: idx + 1]
@@ -480,7 +501,15 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                 continue
             signal = sorted(
                 setup_options,
-                key=lambda item: crypto_trader.score_setup(item, trend_value, None, regime, rel_strength, execution_quality),
+                key=lambda item: crypto_trader.score_setup(
+                    item,
+                    trend_value,
+                    None,
+                    regime,
+                    rel_strength,
+                    execution_quality,
+                    crypto_trader.cross_asset_multiplier(symbol, cross_asset) * cross_asset.risk_multiplier,
+                ),
                 reverse=True,
             )[0]
             candidates.append(
@@ -491,10 +520,19 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                     sentiment=None,
                     trend_score=trend_value,
                     sector=crypto_trader.sector_for_symbol(symbol),
-                    score=crypto_trader.score_setup(signal, trend_value, None, regime, rel_strength, execution_quality),
+                    score=crypto_trader.score_setup(
+                        signal,
+                        trend_value,
+                        None,
+                        regime,
+                        rel_strength,
+                        execution_quality,
+                        crypto_trader.cross_asset_multiplier(symbol, cross_asset) * cross_asset.risk_multiplier,
+                    ),
                     last_price=window_closes[-1],
                     execution_quality=execution_quality,
                     relative_strength=rel_strength,
+                    cross_asset_multiplier=crypto_trader.cross_asset_multiplier(symbol, cross_asset) * cross_asset.risk_multiplier,
                 )
             )
 
@@ -507,7 +545,12 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                 account_equity,
                 allocated_now,
             )
-            qty_size *= candidate.signal.confidence * candidate.regime.risk_multiplier * candidate.execution_quality
+            qty_size *= (
+                candidate.signal.confidence
+                * candidate.regime.risk_multiplier
+                * candidate.execution_quality
+                * candidate.cross_asset_multiplier
+            )
             fill_price = cost_adjusted_price(candidate.signal.breakout_level, config.fee_bps, config.slippage_bps, "buy")
             notional = qty_size * fill_price
             if qty_size <= 0 or notional > cash:

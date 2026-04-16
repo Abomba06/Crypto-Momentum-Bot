@@ -150,6 +150,11 @@ class BotConfig:
     compression_atr_ratio: float
     reversal_lookback: int
     min_execution_quality: float
+    news_momentum_min_acceleration: float
+    news_momentum_max_age_hours: int
+    news_momentum_min_recent_items: int
+    cross_asset_riskoff_penalty: float
+    cross_asset_alt_strength_bonus: float
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -275,6 +280,11 @@ class BotConfig:
             compression_atr_ratio=float(os.getenv("COMPRESSION_ATR_RATIO", "0.85")),
             reversal_lookback=int(os.getenv("REVERSAL_LOOKBACK", "10")),
             min_execution_quality=float(os.getenv("MIN_EXECUTION_QUALITY", "0.55")),
+            news_momentum_min_acceleration=float(os.getenv("NEWS_MOMENTUM_MIN_ACCELERATION", "0.12")),
+            news_momentum_max_age_hours=int(os.getenv("NEWS_MOMENTUM_MAX_AGE_HOURS", "6")),
+            news_momentum_min_recent_items=int(os.getenv("NEWS_MOMENTUM_MIN_RECENT_ITEMS", "2")),
+            cross_asset_riskoff_penalty=float(os.getenv("CROSS_ASSET_RISKOFF_PENALTY", "0.72")),
+            cross_asset_alt_strength_bonus=float(os.getenv("CROSS_ASSET_ALT_STRENGTH_BONUS", "0.08")),
         )
 
 
@@ -333,6 +343,18 @@ class CandidateSetup:
     last_price: float
     execution_quality: float
     relative_strength: float
+    cross_asset_multiplier: float
+
+
+@dataclass(frozen=True)
+class CrossAssetContext:
+    regime: str
+    btc_trend_score: float
+    eth_trend_score: float
+    eth_vs_btc: float
+    risk_multiplier: float
+    majors_multiplier: float
+    alts_multiplier: float
 
 
 def default_state(initial_cash: float) -> Dict[str, Any]:
@@ -445,6 +467,12 @@ def print_dashboard(
         f"Daily halt: {'ON' if daily.get('halt', False) else 'off'} | Weekly halt: {'ON' if state.get('weekly', {}).get('halt', False) else 'off'} | Open order symbols: {', '.join(sorted(open_order_symbols)) if open_order_symbols else 'none'}",
         f"Portfolio heat: {safe_float(state.get('meta', {}).get('portfolio_heat')):.2%} | Loss streak: {int(state.get('meta', {}).get('consecutive_losses', 0))} | Candidates: {int(state.get('meta', {}).get('candidate_count', 0))}",
     ]
+    cross_asset = state.get("meta", {}).get("cross_asset", {})
+    if cross_asset:
+        lines.append(
+            f"Cross-asset: {cross_asset.get('regime', 'neutral')} | BTC trend {safe_float(cross_asset.get('btc_trend_score')):+.2f} "
+            f"| ETH trend {safe_float(cross_asset.get('eth_trend_score')):+.2f} | ETH/BTC RS {safe_float(cross_asset.get('eth_vs_btc')):+.3f}"
+        )
     reconcile = state.get("meta", {}).get("reconciliation", {})
     if reconcile:
         lines.append(
@@ -478,7 +506,7 @@ def print_dashboard(
 
     if snapshots:
         lines.append("Symbol monitor:")
-        header = "  Symbol    Last      Pos$    UPNL%  Regime   Trend  RS     Sentiment          Setup         Action"
+        header = "  Symbol    Last      Pos$    UPNL%  Regime   XAst Trend  RS     Sentiment          Setup         Action"
         lines.append(header)
         lines.append("  " + "-" * (len(header) - 2))
         ranked = sorted(
@@ -503,7 +531,7 @@ def print_dashboard(
             lines.append(
                 f"  {snapshot.get('symbol', ''):<8} {safe_float(snapshot.get('last_price')):>8.3f} "
                 f"{safe_float(snapshot.get('position_value')):>7.0f} {pnl_text:>7} "
-                f"{snapshot.get('regime', 'n/a'):<8} {snapshot.get('trend_label', '?'):<6} "
+                f"{snapshot.get('regime', 'n/a'):<8} {snapshot.get('cross_asset_regime', 'n/a'):<4} {snapshot.get('trend_label', '?'):<6} "
                 f"{safe_float(snapshot.get('relative_strength')):+5.2f} {sentiment_text:<18} "
                 f"{snapshot.get('setup_label', 'idle'):<12} {snapshot.get('last_action', 'watch')}"
             )
@@ -976,6 +1004,55 @@ def sector_for_symbol(symbol: str) -> str:
     return SECTOR_MAP.get(symbol, "other")
 
 
+def default_cross_asset_context() -> CrossAssetContext:
+    return CrossAssetContext(
+        regime="neutral",
+        btc_trend_score=0.0,
+        eth_trend_score=0.0,
+        eth_vs_btc=0.0,
+        risk_multiplier=1.0,
+        majors_multiplier=1.0,
+        alts_multiplier=1.0,
+    )
+
+
+def compute_cross_asset_context(config: BotConfig, benchmark_context: Dict[str, List[float]]) -> CrossAssetContext:
+    btc_closes = benchmark_context.get("BTC/USD")
+    eth_closes = benchmark_context.get("ETH/USD")
+    if not btc_closes and not eth_closes:
+        return default_cross_asset_context()
+
+    btc_trend_score = 0.0
+    eth_trend_score = 0.0
+    btc_trend_ok = False
+    eth_trend_ok = False
+    if btc_closes and len(btc_closes) >= max(config.htf_slow + config.htf_slope_n, config.warmup_htf):
+        btc_trend_ok, btc_fast, btc_slow, btc_slope = compute_trend_ok(config, btc_closes)
+        btc_trend_score = trend_score(btc_fast, btc_slow, btc_slope, btc_closes[-1])
+    if eth_closes and len(eth_closes) >= max(config.htf_slow + config.htf_slope_n, config.warmup_htf):
+        eth_trend_ok, eth_fast, eth_slow, eth_slope = compute_trend_ok(config, eth_closes)
+        eth_trend_score = trend_score(eth_fast, eth_slow, eth_slope, eth_closes[-1])
+
+    eth_vs_btc = relative_strength_score(eth_closes or [], btc_closes, config.rs_lookback)
+    if btc_trend_ok and eth_trend_ok and eth_vs_btc > 0.02:
+        return CrossAssetContext("risk-on", btc_trend_score, eth_trend_score, eth_vs_btc, 1.06, 1.02, 1.08)
+    if btc_trend_ok and btc_trend_score >= 1.0 and eth_vs_btc <= -0.01:
+        return CrossAssetContext("majors-lead", btc_trend_score, eth_trend_score, eth_vs_btc, 0.98, 1.04, 0.92)
+    if btc_trend_score <= -0.6 and eth_trend_score <= -0.4:
+        penalty = max(0.45, min(0.95, config.cross_asset_riskoff_penalty))
+        return CrossAssetContext("risk-off", btc_trend_score, eth_trend_score, eth_vs_btc, penalty, 0.88, penalty)
+    if eth_trend_ok and eth_vs_btc > 0.04:
+        alt_bonus = max(0.0, min(0.20, config.cross_asset_alt_strength_bonus))
+        return CrossAssetContext("alts-lead", btc_trend_score, eth_trend_score, eth_vs_btc, 1.02, 0.98, 1.02 + alt_bonus)
+    return CrossAssetContext("neutral", btc_trend_score, eth_trend_score, eth_vs_btc, 1.0, 1.0, 1.0)
+
+
+def cross_asset_multiplier(symbol: str, cross_asset: CrossAssetContext) -> float:
+    if sector_for_symbol(symbol) == "majors":
+        return cross_asset.majors_multiplier
+    return cross_asset.alts_multiplier
+
+
 def portfolio_heat(positions: Dict[str, BrokerPosition], state: Dict[str, Any], prices_now: Dict[str, float], equity: float) -> float:
     if equity <= 0:
         return 0.0
@@ -1046,6 +1123,7 @@ def update_symbol_snapshot(
     regime: Optional[RegimeSnapshot] = None,
     relative_strength: float = 0.0,
     execution_quality: float = 1.0,
+    cross_asset: Optional[CrossAssetContext] = None,
 ) -> None:
     sym_state = get_sym_state(state, symbol)
     sym_state["snapshot"] = {
@@ -1060,6 +1138,8 @@ def update_symbol_snapshot(
         "regime": None if regime is None else regime.name,
         "relative_strength": relative_strength,
         "execution_quality": execution_quality,
+        "cross_asset_regime": None if cross_asset is None else cross_asset.regime,
+        "cross_asset_multiplier": 1.0 if cross_asset is None else cross_asset_multiplier(symbol, cross_asset),
         "sentiment_score": None if sentiment_snapshot is None else sentiment_snapshot.score,
         "sentiment_label": "n/a" if sentiment_snapshot is None else sentiment_snapshot.label,
         "sentiment_samples": 0 if sentiment_snapshot is None else sentiment_snapshot.sample_size,
@@ -1320,6 +1400,71 @@ def build_sentiment_entry_signal(
     )
 
 
+def build_news_momentum_signal(
+    config: BotConfig,
+    closes: List[float],
+    highs: List[float],
+    lows: List[float],
+    volumes: List[float],
+    snapshot: Optional[SentimentSnapshot],
+) -> Optional[EntrySignal]:
+    if snapshot is None:
+        return None
+    if snapshot.score < config.sentiment_buy_threshold:
+        return None
+    if snapshot.acceleration < config.news_momentum_min_acceleration:
+        return None
+
+    now = now_utc()
+    recent_items = [
+        item
+        for item in snapshot.items
+        if item.published_at is not None
+        and (now - item.published_at).total_seconds() <= config.news_momentum_max_age_hours * 3600
+    ]
+    if len(recent_items) < config.news_momentum_min_recent_items:
+        return None
+
+    severe_negative_tags = {"hack", "exploit", "lawsuit", "investigation", "delisting", "liquidation"}
+    if any(tag in severe_negative_tags for item in recent_items for tag in item.event_tags):
+        return None
+
+    catalyst_tags = {"approval", "etf", "partnership", "listing", "upgrade", "launch"}
+    catalyst_count = sum(1 for item in recent_items for tag in item.event_tags if tag in catalyst_tags)
+    recent_weighted_score = sum(item.score * item.weight for item in recent_items) / max(
+        sum(item.weight for item in recent_items),
+        1e-9,
+    )
+    if catalyst_count <= 0 and recent_weighted_score < config.sentiment_buy_threshold + 0.05:
+        return None
+
+    base_signal = build_sentiment_entry_signal(config, closes, highs, lows, volumes)
+    if base_signal is None:
+        return None
+
+    recent_share = len(recent_items) / max(snapshot.sample_size, 1)
+    confidence = 0.74
+    confidence += min(0.10, max(0.0, snapshot.score - config.sentiment_buy_threshold) * 0.4)
+    confidence += min(0.08, max(0.0, snapshot.acceleration - config.news_momentum_min_acceleration) * 0.6)
+    confidence += min(0.05, catalyst_count * 0.02)
+    confidence += min(0.05, recent_share * 0.05)
+    return EntrySignal(
+        breakout_level=base_signal.breakout_level,
+        stop=base_signal.stop,
+        tp1=base_signal.tp1,
+        tp2=base_signal.tp2,
+        trail_anchor=base_signal.trail_anchor,
+        atr_value=base_signal.atr_value,
+        volume_ratio=base_signal.volume_ratio,
+        rsi_value=base_signal.rsi_value,
+        source="news_momentum",
+        confidence=max(0.65, min(0.94, confidence)),
+        atr_pct=base_signal.atr_pct,
+        ema_spread_pct=base_signal.ema_spread_pct,
+        reason="fresh_news_catalyst",
+    )
+
+
 def build_pullback_entry_signal(
     config: BotConfig,
     closes: List[float],
@@ -1472,10 +1617,18 @@ def score_setup(
     regime: RegimeSnapshot,
     relative_strength: float = 0.0,
     execution_quality: float = 1.0,
+    cross_asset_factor: float = 1.0,
 ) -> float:
     sentiment_score = 0.0 if sentiment_snapshot is None else sentiment_snapshot.score
     acceleration = 0.0 if sentiment_snapshot is None else sentiment_snapshot.acceleration
-    source_bonus = {"technical": 0.10, "pullback": 0.12, "sentiment": 0.08, "compression": 0.14, "reversal": 0.10}.get(signal.source, 0.0)
+    source_bonus = {
+        "technical": 0.10,
+        "pullback": 0.12,
+        "sentiment": 0.08,
+        "compression": 0.14,
+        "reversal": 0.10,
+        "news_momentum": 0.16,
+    }.get(signal.source, 0.0)
     base = (
         signal.confidence
         + source_bonus
@@ -1484,7 +1637,7 @@ def score_setup(
         + min(0.10, max(0.0, acceleration * 0.4))
         + min(0.18, max(-0.12, relative_strength * 1.8))
     )
-    return base * regime.risk_multiplier * execution_quality
+    return base * regime.risk_multiplier * execution_quality * cross_asset_factor
 
 
 def sentiment_allows_entry(config: BotConfig, snapshot: Optional[SentimentSnapshot]) -> bool:
@@ -1611,7 +1764,12 @@ def execute_ranked_entries(
             allocated,
         )
         if buy_qty > 0:
-            buy_qty *= candidate.signal.confidence * candidate.regime.risk_multiplier * candidate.execution_quality
+            buy_qty *= (
+                candidate.signal.confidence
+                * candidate.regime.risk_multiplier
+                * candidate.execution_quality
+                * candidate.cross_asset_multiplier
+            )
         if buy_qty <= 0:
             set_snapshot_candidate_score(state, symbol, candidate.score)
             state["sym"][symbol]["snapshot"]["last_action"] = "size zero"
@@ -1667,7 +1825,8 @@ def execute_ranked_entries(
             f"score={candidate.score:.3f};rsi={candidate.signal.rsi_value:.2f};vol_ratio={candidate.signal.volume_ratio:.2f};"
             f"atr={candidate.signal.atr_value:.6f};atr_pct={candidate.signal.atr_pct:.4f};"
             f"ema_spread_pct={candidate.signal.ema_spread_pct:.4f};regime={candidate.regime.name};"
-            f"reason={candidate.signal.reason};exec_q={candidate.execution_quality:.3f};rs={candidate.relative_strength:.4f}"
+            f"reason={candidate.signal.reason};exec_q={candidate.execution_quality:.3f};rs={candidate.relative_strength:.4f};"
+            f"cross_asset={candidate.cross_asset_multiplier:.3f}"
         )
         if candidate.sentiment is not None:
             note += f";sentiment={candidate.sentiment.score:.3f};sentiment_accel={candidate.sentiment.acceleration:.3f}"
@@ -1759,6 +1918,7 @@ def process_symbol(
     open_order_symbols: Set[str],
     prices_now: Dict[str, float],
     benchmark_context: Dict[str, List[float]],
+    cross_asset: CrossAssetContext,
 ) -> Optional[CandidateSetup]:
     sym_state = get_sym_state(state, symbol)
     position = positions.get(symbol)
@@ -1797,6 +1957,7 @@ def process_symbol(
     benchmark = btc_benchmark if symbol != "BTC/USD" else eth_benchmark
     rel_strength = relative_strength_score(closes, benchmark, config.rs_lookback)
     execution_quality = estimate_execution_quality(symbol, atr_pct_live, vol_ratio_live)
+    symbol_cross_asset_factor = cross_asset_multiplier(symbol, cross_asset) * cross_asset.risk_multiplier
     breakout_signal = build_entry_signal(config, closes, highs, lows, volumes)
     pullback_signal = build_pullback_entry_signal(config, closes, highs, lows, volumes)
     compression_signal = build_compression_breakout_signal(config, closes, highs, lows, volumes)
@@ -1840,6 +2001,7 @@ def process_symbol(
             regime=regime,
             relative_strength=rel_strength,
             execution_quality=execution_quality,
+            cross_asset=cross_asset,
         )
         log_line(config, f"{symbol} muted (startup)")
         sym_state["prev_price"] = last
@@ -1861,6 +2023,7 @@ def process_symbol(
             regime=regime,
             relative_strength=rel_strength,
             execution_quality=execution_quality,
+            cross_asset=cross_asset,
         )
         log_line(config, f"{symbol} has open orders; waiting.")
         sym_state["prev_price"] = last
@@ -1876,9 +2039,12 @@ def process_symbol(
             setup_options.append(compression_signal)
         if reversal_signal and regime.allow_trend:
             setup_options.append(reversal_signal)
+        news_momentum_signal = build_news_momentum_signal(config, closes, highs, lows, volumes, sentiment_snapshot)
+        if news_momentum_signal and (trend_ok or sentiment_triggers_primary_entry(config, sentiment_snapshot)):
+            setup_options.append(news_momentum_signal)
 
         if not trend_ok and regime.allow_trend:
-            setup_options = [signal for signal in setup_options if signal.source in {"sentiment", "reversal"}]
+            setup_options = [signal for signal in setup_options if signal.source in {"sentiment", "reversal", "news_momentum"}]
 
         if not can_open_new_risk(config, state):
             action_label = "halted"
@@ -1905,20 +2071,31 @@ def process_symbol(
                     regime=regime,
                     relative_strength=rel_strength,
                     execution_quality=execution_quality,
+                    cross_asset=cross_asset,
                 )
                 log_line(config, f"{symbol} sentiment did not confirm long entry.")
                 sym_state["prev_price"] = last
                 return None
 
             if sentiment_triggers_primary_entry(config, sentiment_snapshot):
-                momentum_signal = build_sentiment_entry_signal(config, closes, highs, lows, volumes)
-                if momentum_signal is not None:
+                momentum_signal = build_news_momentum_signal(config, closes, highs, lows, volumes, sentiment_snapshot)
+                if momentum_signal is None:
+                    momentum_signal = build_sentiment_entry_signal(config, closes, highs, lows, volumes)
+                if momentum_signal is not None and all(item.source != momentum_signal.source for item in setup_options):
                     setup_options.append(momentum_signal)
                 action_label = "sentiment setup"
 
         ranked_setups = sorted(
             setup_options,
-            key=lambda signal: score_setup(signal, trend_value, sentiment_snapshot, regime, rel_strength, execution_quality),
+            key=lambda signal: score_setup(
+                signal,
+                trend_value,
+                sentiment_snapshot,
+                regime,
+                rel_strength,
+                execution_quality,
+                symbol_cross_asset_factor,
+            ),
             reverse=True,
         )
         entry_signal = ranked_setups[0] if ranked_setups else None
@@ -1927,11 +2104,19 @@ def process_symbol(
         if (
             entry_signal
             and can_fire(config, sym_state)
-            and (trend_ok or entry_signal.source in {"sentiment", "reversal"})
+            and (trend_ok or entry_signal.source in {"sentiment", "reversal", "news_momentum"})
             and rel_strength >= config.min_relative_strength
             and execution_quality >= config.min_execution_quality
         ):
-            candidate_score = score_setup(entry_signal, trend_value, sentiment_snapshot, regime, rel_strength, execution_quality)
+            candidate_score = score_setup(
+                entry_signal,
+                trend_value,
+                sentiment_snapshot,
+                regime,
+                rel_strength,
+                execution_quality,
+                symbol_cross_asset_factor,
+            )
             candidate = CandidateSetup(
                 symbol=symbol,
                 signal=entry_signal,
@@ -1943,6 +2128,7 @@ def process_symbol(
                 last_price=last,
                 execution_quality=execution_quality,
                 relative_strength=rel_strength,
+                cross_asset_multiplier=symbol_cross_asset_factor,
             )
             set_snapshot_candidate_score(state, symbol, candidate_score)
             action_label = f"candidate {entry_signal.source}"
@@ -1975,6 +2161,7 @@ def process_symbol(
             regime=regime,
             relative_strength=rel_strength,
             execution_quality=execution_quality,
+            cross_asset=cross_asset,
         )
         sym_state["prev_price"] = last
         return candidate
@@ -2083,6 +2270,7 @@ def process_symbol(
         regime=regime,
         relative_strength=rel_strength,
         execution_quality=execution_quality,
+        cross_asset=cross_asset,
     )
     sym_state["prev_price"] = last
     return None
@@ -2124,6 +2312,13 @@ def run_once(
                 )
             except Exception as exc:
                 log_line(config, f"{benchmark_symbol} benchmark fetch failed: {type(exc).__name__}: {exc}")
+    cross_asset = compute_cross_asset_context(config, benchmark_context)
+    meta["cross_asset"] = {
+        "regime": cross_asset.regime,
+        "btc_trend_score": round(cross_asset.btc_trend_score, 4),
+        "eth_trend_score": round(cross_asset.eth_trend_score, 4),
+        "eth_vs_btc": round(cross_asset.eth_vs_btc, 4),
+    }
     meta["portfolio_heat"] = portfolio_heat(positions, state, prices_now, account.equity)
     meta["sector_exposure"] = sector_exposure(positions, prices_now, account.equity)
 
@@ -2142,6 +2337,7 @@ def run_once(
                 open_order_symbols=open_order_symbols,
                 prices_now=prices_now,
                 benchmark_context=benchmark_context,
+                cross_asset=cross_asset,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -2155,6 +2351,7 @@ def run_once(
             "score": round(candidate.score, 4),
             "setup": candidate.signal.source,
             "regime": candidate.regime.name,
+            "cross_asset": round(candidate.cross_asset_multiplier, 3),
         }
         for candidate in sorted(candidates, key=lambda item: item.score, reverse=True)[:5]
     ]

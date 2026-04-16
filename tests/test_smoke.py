@@ -88,6 +88,11 @@ def make_config(case_name: str) -> crypto_trader.BotConfig:
         compression_atr_ratio=0.85,
         reversal_lookback=10,
         min_execution_quality=0.55,
+        news_momentum_min_acceleration=0.12,
+        news_momentum_max_age_hours=6,
+        news_momentum_min_recent_items=2,
+        cross_asset_riskoff_penalty=0.72,
+        cross_asset_alt_strength_bonus=0.08,
     )
 
 
@@ -146,6 +151,14 @@ class StrategySmokeTests(unittest.TestCase):
         bad = crypto_trader.estimate_execution_quality("DOGE/USD", 0.06, 0.8)
         self.assertGreater(good, bad)
 
+    def test_compute_cross_asset_context_detects_risk_on(self):
+        config = make_config("cross_asset")
+        btc = [100 + i * 0.18 for i in range(config.warmup_htf + 5)]
+        eth = [100 + i * 0.46 for i in range(config.warmup_htf + 5)]
+        context = crypto_trader.compute_cross_asset_context(config, {"BTC/USD": btc, "ETH/USD": eth})
+        self.assertEqual(context.regime, "risk-on")
+        self.assertGreater(context.alts_multiplier, 1.0)
+
     def test_failed_breakdown_signal_can_trigger(self):
         config = make_config("reversal")
         closes = [100 + ((i % 3) * 0.015) for i in range(78)] + [99.2, 100.35]
@@ -155,6 +168,34 @@ class StrategySmokeTests(unittest.TestCase):
         signal = crypto_trader.build_failed_breakdown_signal(config, closes, highs, lows, volumes)
         self.assertIsNotNone(signal)
         self.assertEqual(signal.source, "reversal")
+
+    def test_build_news_momentum_signal_requires_fresh_bullish_catalyst(self):
+        config = make_config("news_momentum")
+        closes = [100 + ((i % 4) * 0.15) + i * 0.03 for i in range(80)]
+        highs = [c + 1.0 for c in closes]
+        lows = [c - 0.9 for c in closes]
+        volumes = [100.0] * 80
+        now = crypto_trader.now_utc()
+        snapshot = sentiment.SentimentSnapshot(
+            symbol="BTC/USD",
+            score=0.42,
+            label="bullish",
+            sample_size=4,
+            source_counts={"news": 4},
+            items=[
+                sentiment.SentimentItem("news", "reuters", "ETF approval sparks rally", now - timedelta(hours=1), 0.7, 1.2, 1.1, ["approval", "etf"]),
+                sentiment.SentimentItem("news", "bloomberg", "Bitcoin gains after launch", now - timedelta(hours=2), 0.6, 1.1, 1.0, ["launch"]),
+                sentiment.SentimentItem("news", "coindesk", "Adoption grows", now - timedelta(hours=8), 0.4, 0.9, 1.0, []),
+                sentiment.SentimentItem("news", "coindesk", "More bullish flows", now - timedelta(hours=10), 0.3, 0.8, 1.0, []),
+            ],
+            top_headlines=["ETF approval sparks rally"],
+            event_counts={"approval": 1, "etf": 1, "launch": 1},
+            acceleration=0.24,
+            updated_at=now,
+        )
+        signal = crypto_trader.build_news_momentum_signal(config, closes, highs, lows, volumes, snapshot)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.source, "news_momentum")
 
     def test_confirm_mode_requires_positive_sentiment(self):
         config = make_config("confirm_mode")
@@ -313,6 +354,7 @@ class StrategySmokeTests(unittest.TestCase):
             last_price=100.0,
             execution_quality=0.9,
             relative_strength=0.05,
+            cross_asset_multiplier=1.04,
         )
         crypto_trader.get_sym_state(state, "BTC/USD")["snapshot"] = {"symbol": "BTC/USD", "last_action": "watch"}
         broker = FakeBroker()
