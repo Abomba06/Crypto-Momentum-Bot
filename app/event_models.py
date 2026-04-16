@@ -13,6 +13,8 @@ class TwitterWatchAccount:
     enabled: bool = True
     related_assets: List[str] = field(default_factory=list)
     tags: List[str] = field(default_factory=list)
+    aliases: List[str] = field(default_factory=list)
+    denylist: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

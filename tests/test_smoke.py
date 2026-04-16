@@ -416,6 +416,8 @@ class StrategySmokeTests(unittest.TestCase):
                             "enabled": True,
                             "related_assets": ["BTC/USD"],
                             "tags": ["etf"],
+                            "aliases": ["secgov"],
+                            "denylist": ["secgovparody"],
                         }
                     ]
                 }
@@ -442,6 +444,33 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertGreater(snapshot.primary_twitter_score, 0.0)
         self.assertEqual(snapshot.confirmation_state, "confirmed_by_news")
         self.assertGreaterEqual(len(snapshot.top_twitter_posts or []), 1)
+
+    def test_watchlist_loader_keeps_aliases_and_denylist(self):
+        watchlist_path = TEST_TMP_ROOT / "watchlist_aliases.json"
+        watchlist_path.write_text(
+            json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "username": "secgov",
+                            "display_name": "SEC",
+                            "category": "regulators",
+                            "priority": 1.5,
+                            "reliability": 1.5,
+                            "enabled": True,
+                            "aliases": ["secgov_main"],
+                            "denylist": ["secgovparody"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        from app.twitter_watchlist import load_watchlist
+
+        watchlist = load_watchlist(str(watchlist_path))
+        self.assertEqual(watchlist[0].aliases, ["secgov_main"])
+        self.assertEqual(watchlist[0].denylist, ["secgovparody"])
 
     def test_build_research_report_aggregates_closed_trades(self):
         state = crypto_trader.default_state(100000.0)

@@ -235,6 +235,10 @@ def author_weight(priority: float, reliability: float) -> float:
     return max(0.5, min(2.0, (0.55 * priority) + (0.45 * reliability)))
 
 
+def normalize_username(value: str) -> str:
+    return value.strip().lstrip("@").lower()
+
+
 def event_tags(text: str) -> List[str]:
     lowered = text.lower()
     tags = {tag for phrase, tag in EVENT_TERMS.items() if phrase in lowered}
@@ -506,6 +510,9 @@ class SentimentClient:
                 title = (node.findtext("title") or "").strip()
                 description = (node.findtext("description") or "").strip()
                 published_at = parse_pubdate(node.findtext("pubDate"))
+                author_hint = self._extract_author_hint(title, description, account)
+                if not self._author_matches_watchlist(author_hint, account):
+                    continue
                 if not self._within_lookback(published_at, now):
                     continue
                 if published_at is not None and (now - published_at).total_seconds() > self.twitter_event_max_age_minutes * 60:
@@ -562,6 +569,26 @@ class SentimentClient:
                 if len(items) >= self.twitter_limit:
                     return items
         return items
+
+    def _extract_author_hint(self, title: str, description: str, account: TwitterWatchAccount) -> str:
+        for text in (title, description):
+            match = re.search(r"@([A-Za-z0-9_]+)", text or "")
+            if match:
+                return normalize_username(match.group(1))
+        return account.username
+
+    def _author_matches_watchlist(self, author_hint: str, account: TwitterWatchAccount) -> bool:
+        normalized = normalize_username(author_hint)
+        if normalized in set(account.denylist):
+            return False
+        allowed = {account.username, *account.aliases}
+        if normalized not in allowed:
+            return normalized == account.username
+        lowered_display = account.display_name.lower()
+        parody_markers = ("parody", "fake", "fan", "impersonator")
+        if any(marker in lowered_display for marker in parody_markers):
+            return False
+        return True
 
     def _match_symbols_and_keywords(self, text: str, account: TwitterWatchAccount) -> tuple[List[str], List[str]]:
         lowered = text.lower()

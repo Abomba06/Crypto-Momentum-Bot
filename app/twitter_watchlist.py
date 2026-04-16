@@ -31,6 +31,8 @@ def load_watchlist(path: str) -> List[TwitterWatchAccount]:
                 enabled=bool(item.get("enabled", True)),
                 related_assets=[str(value).strip().upper() for value in item.get("related_assets", []) if str(value).strip()],
                 tags=[str(value).strip().lower() for value in item.get("tags", []) if str(value).strip()],
+                aliases=[str(value).strip().lstrip("@").lower() for value in item.get("aliases", []) if str(value).strip()],
+                denylist=[str(value).strip().lstrip("@").lower() for value in item.get("denylist", []) if str(value).strip()],
             )
         )
     return [account for account in results if account.enabled]

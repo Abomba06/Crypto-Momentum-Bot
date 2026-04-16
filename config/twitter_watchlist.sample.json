@@ -8,7 +8,9 @@
       "reliability": 1.5,
       "enabled": true,
       "related_assets": ["BTC/USD", "ETH/USD"],
-      "tags": ["etf", "regulation"]
+      "tags": ["etf", "regulation"],
+      "aliases": ["secgov"],
+      "denylist": ["secgovparody", "fake_secgov"]
     },
     {
       "username": "tier10k",
@@ -18,7 +20,9 @@
       "reliability": 1.25,
       "enabled": true,
       "related_assets": ["BTC/USD", "ETH/USD", "SOL/USD"],
-      "tags": ["etf", "breaking"]
+      "tags": ["etf", "breaking"],
+      "aliases": ["tier10k"],
+      "denylist": ["tier10kparody"]
     },
     {
       "username": "coinbaseassets",
@@ -28,7 +32,9 @@
       "reliability": 1.2,
       "enabled": true,
       "related_assets": ["SOL/USD", "LINK/USD", "DOGE/USD"],
-      "tags": ["listing", "delisting"]
+      "tags": ["listing", "delisting"],
+      "aliases": ["coinbaseassets"],
+      "denylist": ["coinbaseassetss"]
     }
   ]
 }
