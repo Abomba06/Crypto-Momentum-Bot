@@ -2,6 +2,11 @@ import backtrader as bt
 import numpy as np
 import pandas as pd
 
+try:
+    from sklearn.mixture import GaussianMixture  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    GaussianMixture = None
+
 
 def sma(series: pd.Series, n: int) -> pd.Series:
     return series.rolling(n).mean()
@@ -92,3 +97,45 @@ class SmaCross(bt.Strategy):
                 self.buy(size=size)
         elif self.position.size > 0 and self.cross < 0:
             self.close()
+
+
+def adaptive_regime_detector(closes: list[float], lookback: int = 252) -> dict:
+    if len(closes) < max(30, lookback // 4):
+        return {"name": "insufficient", "trend_score": 0.0, "vol_score": 0.0, "risk_multiplier": 1.0}
+    series = pd.Series(closes[-lookback:], dtype="float64")
+    returns = series.pct_change().dropna()
+    if returns.empty:
+        return {"name": "insufficient", "trend_score": 0.0, "vol_score": 0.0, "risk_multiplier": 1.0}
+    realized_vol = float(returns.rolling(20).std().iloc[-1] * np.sqrt(252)) if len(returns) >= 20 else float(returns.std() * np.sqrt(252))
+    momentum = float((series.iloc[-1] / max(series.iloc[-20], 1e-9)) - 1.0) if len(series) > 20 else 0.0
+    trend_score = momentum * 10.0
+    vol_score = realized_vol
+
+    if GaussianMixture is not None and len(returns) >= 60:
+        feats = pd.DataFrame(
+            {
+                "ret": returns,
+                "vol": returns.rolling(10).std().fillna(returns.std()),
+                "mom": returns.rolling(10).mean().fillna(0.0),
+            }
+        ).dropna()
+        if len(feats) >= 30:
+            model = GaussianMixture(n_components=3, covariance_type="full", random_state=7)
+            labels = model.fit_predict(feats)
+            latest = int(labels[-1])
+            cluster = feats.iloc[np.where(labels == latest)[0]]
+            cluster_mom = float(cluster["mom"].mean())
+            cluster_vol = float(cluster["vol"].mean())
+            if cluster_mom > 0 and cluster_vol < feats["vol"].quantile(0.6):
+                return {"name": "bull_trend", "trend_score": trend_score, "vol_score": vol_score, "risk_multiplier": 1.12}
+            if cluster_mom < 0 and cluster_vol > feats["vol"].quantile(0.6):
+                return {"name": "bear_shock", "trend_score": trend_score, "vol_score": vol_score, "risk_multiplier": 0.65}
+            return {"name": "range", "trend_score": trend_score, "vol_score": vol_score, "risk_multiplier": 0.88}
+
+    if momentum > 0.03 and realized_vol < 0.55:
+        return {"name": "bull_trend", "trend_score": trend_score, "vol_score": vol_score, "risk_multiplier": 1.10}
+    if momentum < -0.03 and realized_vol > 0.45:
+        return {"name": "bear_shock", "trend_score": trend_score, "vol_score": vol_score, "risk_multiplier": 0.70}
+    if realized_vol < 0.30:
+        return {"name": "range", "trend_score": trend_score, "vol_score": vol_score, "risk_multiplier": 0.92}
+    return {"name": "transition", "trend_score": trend_score, "vol_score": vol_score, "risk_multiplier": 0.84}
