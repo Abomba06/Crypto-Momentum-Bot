@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from types import SimpleNamespace
+from itertools import product
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -531,6 +532,40 @@ def walk_forward_validate(df: pd.DataFrame, config: Optional[BacktestConfig] = N
         "avg_win_rate": sum(item["win_rate"] for item in windows) / max(len(windows), 1),
     }
     return {"windows": windows, "summary": summary}
+
+
+def parameter_sweep(
+    df: pd.DataFrame,
+    base_config: Optional[BacktestConfig] = None,
+    grid: Optional[Dict[str, List[Any]]] = None,
+) -> Dict[str, Any]:
+    base_config = base_config or BacktestConfig()
+    grid = grid or {
+        "donchian": [16, 20],
+        "rsi_entry_min": [54.0, 56.0],
+        "max_breakout_atr_extension": [0.6, 0.8],
+    }
+    keys = list(grid.keys())
+    variants = []
+    for values in product(*(grid[key] for key in keys)):
+        params = dict(zip(keys, values))
+        config = BacktestConfig(**{**base_config.__dict__, **params})
+        result = simulate_strategy(df, config)
+        metrics = dict(result["metrics"])
+        score = metrics["total_return_pct"] - (0.5 * metrics["max_drawdown_pct"])
+        variants.append(
+            {
+                "params": params,
+                "metrics": metrics,
+                "score": score,
+            }
+        )
+    variants.sort(key=lambda item: item["score"], reverse=True)
+    return {
+        "evaluated": len(variants),
+        "best": variants[0] if variants else None,
+        "top": variants[: min(5, len(variants))],
+    }
 
 
 def run(symbol: str = "SPY", start: str = "2018-01-01", cash: float = 100_000) -> float:

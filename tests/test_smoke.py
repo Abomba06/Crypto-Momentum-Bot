@@ -383,6 +383,28 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertEqual(sorted(result["metrics"]["symbols"]), ["AAA", "BBB"])
         self.assertGreater(len(result["equity_curve"]), 0)
 
+    def test_parameter_sweep_returns_ranked_results(self):
+        idx = pd.date_range("2024-01-01", periods=320, freq="D")
+        closes = [100 + ((i % 5) * 0.10) + i * 0.06 for i in range(len(idx))]
+        df = pd.DataFrame(
+            {
+                "open": closes,
+                "high": [c + 1.0 for c in closes],
+                "low": [c - 0.9 for c in closes],
+                "close": closes,
+                "volume": [1000 + (i % 7) * 30 for i in range(len(idx))],
+            },
+            index=idx,
+        )
+        result = backtest.parameter_sweep(
+            df,
+            backtest.BacktestConfig(),
+            {"donchian": [16, 20], "rsi_entry_min": [54.0, 56.0]},
+        )
+        self.assertEqual(result["evaluated"], 4)
+        self.assertIsNotNone(result["best"])
+        self.assertGreaterEqual(len(result["top"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
