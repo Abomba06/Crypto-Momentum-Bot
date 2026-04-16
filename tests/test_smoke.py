@@ -82,6 +82,12 @@ def make_config(case_name: str) -> crypto_trader.BotConfig:
         shock_sentiment_threshold=-0.55,
         signals_csv=root / "signals.csv",
         research_report=root / "research_report.json",
+        rs_lookback=20,
+        min_relative_strength=-0.02,
+        compression_window=12,
+        compression_atr_ratio=0.85,
+        reversal_lookback=10,
+        min_execution_quality=0.55,
     )
 
 
@@ -129,6 +135,26 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertIsNotNone(signal)
         self.assertEqual(signal.source, "sentiment")
         self.assertLess(signal.stop, signal.breakout_level)
+
+    def test_relative_strength_score_positive_when_outperforming(self):
+        symbol = [100 + i * 1.0 for i in range(30)]
+        bench = [100 + i * 0.5 for i in range(30)]
+        self.assertGreater(crypto_trader.relative_strength_score(symbol, bench, 10), 0.0)
+
+    def test_execution_quality_penalizes_worse_conditions(self):
+        good = crypto_trader.estimate_execution_quality("BTC/USD", 0.01, 1.4)
+        bad = crypto_trader.estimate_execution_quality("DOGE/USD", 0.06, 0.8)
+        self.assertGreater(good, bad)
+
+    def test_failed_breakdown_signal_can_trigger(self):
+        config = make_config("reversal")
+        closes = [100 + ((i % 3) * 0.015) for i in range(78)] + [99.2, 100.35]
+        highs = [c + 0.9 for c in closes]
+        lows = [c - 0.8 for c in closes]
+        volumes = [100.0] * 79 + [160.0]
+        signal = crypto_trader.build_failed_breakdown_signal(config, closes, highs, lows, volumes)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.source, "reversal")
 
     def test_confirm_mode_requires_positive_sentiment(self):
         config = make_config("confirm_mode")
@@ -285,6 +311,8 @@ class StrategySmokeTests(unittest.TestCase):
             sector="majors",
             score=1.6,
             last_price=100.0,
+            execution_quality=0.9,
+            relative_strength=0.05,
         )
         crypto_trader.get_sym_state(state, "BTC/USD")["snapshot"] = {"symbol": "BTC/USD", "last_action": "watch"}
         broker = FakeBroker()

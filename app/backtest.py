@@ -121,6 +121,12 @@ def as_runtime_config(config: BacktestConfig) -> Any:
         max_entry_rsi=config.max_entry_rsi,
         ema_slope_lookback=config.ema_slope_lookback,
         pullback_ema_buffer_atr=config.pullback_ema_buffer_atr,
+        compression_window=12,
+        compression_atr_ratio=0.85,
+        reversal_lookback=10,
+        rs_lookback=20,
+        min_relative_strength=-0.02,
+        min_execution_quality=0.55,
     )
 
 
@@ -167,6 +173,12 @@ def portfolio_runtime_config(config: BacktestConfig) -> Any:
     runtime.max_entries_per_loop = config.max_entries_per_bar
     runtime.max_portfolio_heat = config.portfolio_cap
     runtime.max_sector_exposure = 1.0
+    runtime.rs_lookback = config.train_bars // 12 if config.train_bars > 0 else 20
+    runtime.min_relative_strength = -0.02
+    runtime.compression_window = 12
+    runtime.compression_atr_ratio = 0.85
+    runtime.reversal_lookback = 10
+    runtime.min_execution_quality = 0.55
     return runtime
 
 
@@ -219,23 +231,30 @@ def simulate_strategy(df: pd.DataFrame, config: Optional[BacktestConfig] = None)
         atr_pct_live = atr_live / max(last, 1e-9) if atr_live and atr_live == atr_live else 0.0
         vol_ratio_live = crypto_trader.volume_ratio(window_volumes, runtime.volume_window)
         regime = crypto_trader.detect_regime(trend_ok, trend_value, atr_pct_live, vol_ratio_live, None)
+        execution_quality = crypto_trader.estimate_execution_quality(config.symbol, atr_pct_live, vol_ratio_live)
 
         if qty <= 0:
             setup_options = []
             breakout_signal = crypto_trader.build_entry_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             pullback_signal = crypto_trader.build_pullback_entry_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
+            compression_signal = crypto_trader.build_compression_breakout_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
+            reversal_signal = crypto_trader.build_failed_breakdown_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             if breakout_signal and regime.allow_breakout:
                 setup_options.append(breakout_signal)
             if pullback_signal and regime.allow_pullback:
                 setup_options.append(pullback_signal)
+            if compression_signal and regime.allow_breakout:
+                setup_options.append(compression_signal)
+            if reversal_signal and regime.allow_trend:
+                setup_options.append(reversal_signal)
             if setup_options:
                 signal = sorted(
                     setup_options,
-                    key=lambda item: crypto_trader.score_setup(item, trend_value, None, regime),
+                    key=lambda item: crypto_trader.score_setup(item, trend_value, None, regime, 0.0, execution_quality),
                     reverse=True,
                 )[0]
                 qty_size = crypto_trader.size_for_risk(runtime, cash, signal.breakout_level, signal.stop, cash, 0.0)
-                qty_size *= signal.confidence * regime.risk_multiplier
+                qty_size *= signal.confidence * regime.risk_multiplier * execution_quality
                 fill_price = cost_adjusted_price(signal.breakout_level, config.fee_bps, config.slippage_bps, "buy")
                 notional = qty_size * fill_price
                 if qty_size > 0 and notional <= cash:
@@ -441,18 +460,27 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
             atr_pct_live = atr_live / max(window_closes[-1], 1e-9) if atr_live and atr_live == atr_live else 0.0
             vol_ratio_live = crypto_trader.volume_ratio(window_volumes, runtime.volume_window)
             regime = crypto_trader.detect_regime(trend_ok, trend_value, atr_pct_live, vol_ratio_live, None)
+            benchmark = closes["BTC/USD"][: idx + 1] if "BTC/USD" in closes and symbol != "BTC/USD" else None
+            rel_strength = crypto_trader.relative_strength_score(window_closes, benchmark, runtime.rs_lookback)
+            execution_quality = crypto_trader.estimate_execution_quality(symbol, atr_pct_live, vol_ratio_live)
             setup_options = []
             breakout_signal = crypto_trader.build_entry_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             pullback_signal = crypto_trader.build_pullback_entry_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
+            compression_signal = crypto_trader.build_compression_breakout_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
+            reversal_signal = crypto_trader.build_failed_breakdown_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             if breakout_signal and regime.allow_breakout:
                 setup_options.append(breakout_signal)
             if pullback_signal and regime.allow_pullback:
                 setup_options.append(pullback_signal)
-            if not setup_options:
+            if compression_signal and regime.allow_breakout:
+                setup_options.append(compression_signal)
+            if reversal_signal and regime.allow_trend:
+                setup_options.append(reversal_signal)
+            if not setup_options or rel_strength < runtime.min_relative_strength or execution_quality < runtime.min_execution_quality:
                 continue
             signal = sorted(
                 setup_options,
-                key=lambda item: crypto_trader.score_setup(item, trend_value, None, regime),
+                key=lambda item: crypto_trader.score_setup(item, trend_value, None, regime, rel_strength, execution_quality),
                 reverse=True,
             )[0]
             candidates.append(
@@ -463,8 +491,10 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                     sentiment=None,
                     trend_score=trend_value,
                     sector=crypto_trader.sector_for_symbol(symbol),
-                    score=crypto_trader.score_setup(signal, trend_value, None, regime),
+                    score=crypto_trader.score_setup(signal, trend_value, None, regime, rel_strength, execution_quality),
                     last_price=window_closes[-1],
+                    execution_quality=execution_quality,
+                    relative_strength=rel_strength,
                 )
             )
 
@@ -477,7 +507,7 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                 account_equity,
                 allocated_now,
             )
-            qty_size *= candidate.signal.confidence * candidate.regime.risk_multiplier
+            qty_size *= candidate.signal.confidence * candidate.regime.risk_multiplier * candidate.execution_quality
             fill_price = cost_adjusted_price(candidate.signal.breakout_level, config.fee_bps, config.slippage_bps, "buy")
             notional = qty_size * fill_price
             if qty_size <= 0 or notional > cash:

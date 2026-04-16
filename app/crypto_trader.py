@@ -40,6 +40,20 @@ SECTOR_MAP = {
     "XRP/USD": "payments",
 }
 
+SPREAD_BPS_MAP = {
+    "BTC/USD": 4.0,
+    "ETH/USD": 5.0,
+    "SOL/USD": 8.0,
+    "DOGE/USD": 10.0,
+    "AVAX/USD": 10.0,
+    "LINK/USD": 9.0,
+    "ADA/USD": 9.0,
+    "MATIC/USD": 10.0,
+    "UNI/USD": 11.0,
+    "LTC/USD": 8.0,
+    "XRP/USD": 9.0,
+}
+
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -130,6 +144,12 @@ class BotConfig:
     shock_sentiment_threshold: float
     signals_csv: pathlib.Path
     research_report: pathlib.Path
+    rs_lookback: int
+    min_relative_strength: float
+    compression_window: int
+    compression_atr_ratio: float
+    reversal_lookback: int
+    min_execution_quality: float
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -249,6 +269,12 @@ class BotConfig:
             max_consecutive_losses=int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4")),
             pullback_ema_buffer_atr=float(os.getenv("PULLBACK_EMA_BUFFER_ATR", "0.35")),
             shock_sentiment_threshold=float(os.getenv("SHOCK_SENTIMENT_THRESHOLD", "-0.55")),
+            rs_lookback=int(os.getenv("RS_LOOKBACK", "20")),
+            min_relative_strength=float(os.getenv("MIN_RELATIVE_STRENGTH", "-0.02")),
+            compression_window=int(os.getenv("COMPRESSION_WINDOW", "12")),
+            compression_atr_ratio=float(os.getenv("COMPRESSION_ATR_RATIO", "0.85")),
+            reversal_lookback=int(os.getenv("REVERSAL_LOOKBACK", "10")),
+            min_execution_quality=float(os.getenv("MIN_EXECUTION_QUALITY", "0.55")),
         )
 
 
@@ -305,6 +331,8 @@ class CandidateSetup:
     sector: str
     score: float
     last_price: float
+    execution_quality: float
+    relative_strength: float
 
 
 def default_state(initial_cash: float) -> Dict[str, Any]:
@@ -450,7 +478,7 @@ def print_dashboard(
 
     if snapshots:
         lines.append("Symbol monitor:")
-        header = "  Symbol    Last      Pos$    UPNL%  Regime   Trend  Sentiment          Setup         Action"
+        header = "  Symbol    Last      Pos$    UPNL%  Regime   Trend  RS     Sentiment          Setup         Action"
         lines.append(header)
         lines.append("  " + "-" * (len(header) - 2))
         ranked = sorted(
@@ -475,7 +503,8 @@ def print_dashboard(
             lines.append(
                 f"  {snapshot.get('symbol', ''):<8} {safe_float(snapshot.get('last_price')):>8.3f} "
                 f"{safe_float(snapshot.get('position_value')):>7.0f} {pnl_text:>7} "
-                f"{snapshot.get('regime', 'n/a'):<8} {snapshot.get('trend_label', '?'):<6} {sentiment_text:<18} "
+                f"{snapshot.get('regime', 'n/a'):<8} {snapshot.get('trend_label', '?'):<6} "
+                f"{safe_float(snapshot.get('relative_strength')):+5.2f} {sentiment_text:<18} "
                 f"{snapshot.get('setup_label', 'idle'):<12} {snapshot.get('last_action', 'watch')}"
             )
             headlines = snapshot.get("top_headlines", [])
@@ -1015,6 +1044,8 @@ def update_symbol_snapshot(
     entry_signal: Optional[EntrySignal],
     last_action: str,
     regime: Optional[RegimeSnapshot] = None,
+    relative_strength: float = 0.0,
+    execution_quality: float = 1.0,
 ) -> None:
     sym_state = get_sym_state(state, symbol)
     sym_state["snapshot"] = {
@@ -1027,6 +1058,8 @@ def update_symbol_snapshot(
         "trend_score": trend_value,
         "trend_label": summarize_trend(trend_value, trend_ok),
         "regime": None if regime is None else regime.name,
+        "relative_strength": relative_strength,
+        "execution_quality": execution_quality,
         "sentiment_score": None if sentiment_snapshot is None else sentiment_snapshot.score,
         "sentiment_label": "n/a" if sentiment_snapshot is None else sentiment_snapshot.label,
         "sentiment_samples": 0 if sentiment_snapshot is None else sentiment_snapshot.sample_size,
@@ -1150,6 +1183,27 @@ def volume_ratio(volumes: List[float], window: int) -> float:
     if baseline <= 0:
         return 1.0
     return volumes[-1] / baseline
+
+
+def trailing_return(seq: List[float], lookback: int) -> float:
+    if len(seq) <= lookback or seq[-lookback - 1] <= 0:
+        return 0.0
+    return (seq[-1] / seq[-lookback - 1]) - 1.0
+
+
+def relative_strength_score(symbol_closes: List[float], benchmark_closes: Optional[List[float]], lookback: int) -> float:
+    if benchmark_closes is None:
+        return 0.0
+    return trailing_return(symbol_closes, lookback) - trailing_return(benchmark_closes, lookback)
+
+
+def estimate_execution_quality(symbol: str, atr_pct: float, vol_ratio: float) -> float:
+    spread_bps = SPREAD_BPS_MAP.get(symbol, 12.0)
+    spread_penalty = min(0.25, spread_bps / 100.0)
+    vol_bonus = 0.0 if not math.isfinite(vol_ratio) else min(0.18, max(-0.10, (vol_ratio - 1.0) * 0.18))
+    atr_penalty = min(0.20, max(0.0, (atr_pct - 0.03) * 4.0))
+    quality = 0.92 - spread_penalty + vol_bonus - atr_penalty
+    return max(0.35, min(1.0, quality))
 
 
 def build_entry_signal(
@@ -1325,17 +1379,112 @@ def build_pullback_entry_signal(
     )
 
 
-def score_setup(signal: EntrySignal, trend_value: float, sentiment_snapshot: Optional[SentimentSnapshot], regime: RegimeSnapshot) -> float:
+def build_compression_breakout_signal(
+    config: BotConfig,
+    closes: List[float],
+    highs: List[float],
+    lows: List[float],
+    volumes: List[float],
+) -> Optional[EntrySignal]:
+    if len(closes) < max(config.warmup_ltf, config.compression_window + config.atr_len + 5):
+        return None
+    atr_value = atr(highs, lows, closes, config.atr_len)
+    if not math.isfinite(atr_value) or atr_value <= 0:
+        return None
+    recent_atrs = []
+    for idx in range(len(closes) - config.compression_window, len(closes)):
+        window_atr = atr(highs[: idx + 1], lows[: idx + 1], closes[: idx + 1], config.atr_len)
+        if math.isfinite(window_atr):
+            recent_atrs.append(window_atr)
+    if len(recent_atrs) < max(3, config.compression_window // 2):
+        return None
+    avg_recent_atr = sum(recent_atrs) / len(recent_atrs)
+    if atr_value > avg_recent_atr * config.compression_atr_ratio:
+        return None
+    breakout = build_entry_signal(config, closes, highs, lows, volumes)
+    if breakout is None:
+        return None
+    confidence = min(0.95, breakout.confidence + 0.05)
+    return EntrySignal(
+        breakout_level=breakout.breakout_level,
+        stop=breakout.stop,
+        tp1=breakout.tp1,
+        tp2=breakout.tp2,
+        trail_anchor=breakout.trail_anchor,
+        atr_value=breakout.atr_value,
+        volume_ratio=breakout.volume_ratio,
+        rsi_value=breakout.rsi_value,
+        source="compression",
+        confidence=confidence,
+        atr_pct=breakout.atr_pct,
+        ema_spread_pct=breakout.ema_spread_pct,
+        reason="volatility_compression_breakout",
+    )
+
+
+def build_failed_breakdown_signal(
+    config: BotConfig,
+    closes: List[float],
+    highs: List[float],
+    lows: List[float],
+    volumes: List[float],
+) -> Optional[EntrySignal]:
+    if len(closes) < max(config.warmup_ltf, config.reversal_lookback + config.atr_len + 5):
+        return None
+    atr_value = atr(highs, lows, closes, config.atr_len)
+    if not math.isfinite(atr_value) or atr_value <= 0:
+        return None
+    breakdown_hi, breakdown_lo = donchian(closes[:-2], config.reversal_lookback)
+    if not math.isfinite(breakdown_lo):
+        return None
+    prev_close = closes[-2]
+    last = closes[-1]
+    rsi_value = rsi(closes, config.rsi_len)
+    vol_ratio = volume_ratio(volumes, config.volume_window)
+    failed_breakdown = prev_close < breakdown_lo and last > breakdown_lo and last > prev_close
+    if not failed_breakdown:
+        return None
+    if rsi_value < max(46.0, config.rsi_entry_min - 8.0) or rsi_value > config.max_entry_rsi:
+        return None
+    stop = min(lows[-3:]) - (0.35 * atr_value)
+    confidence = 0.68 + min(0.10, max(0.0, (vol_ratio - 1.0) * 0.12))
+    return EntrySignal(
+        breakout_level=last,
+        stop=stop,
+        tp1=last + config.tp1_atr * atr_value,
+        tp2=last + config.tp2_atr * atr_value,
+        trail_anchor=last - config.trail_atr * atr_value,
+        atr_value=atr_value,
+        volume_ratio=vol_ratio,
+        rsi_value=rsi_value,
+        source="reversal",
+        confidence=max(0.55, min(0.88, confidence)),
+        atr_pct=atr_value / max(last, 1e-9),
+        ema_spread_pct=0.0,
+        reason="failed_breakdown_reversal",
+    )
+
+
+def score_setup(
+    signal: EntrySignal,
+    trend_value: float,
+    sentiment_snapshot: Optional[SentimentSnapshot],
+    regime: RegimeSnapshot,
+    relative_strength: float = 0.0,
+    execution_quality: float = 1.0,
+) -> float:
     sentiment_score = 0.0 if sentiment_snapshot is None else sentiment_snapshot.score
     acceleration = 0.0 if sentiment_snapshot is None else sentiment_snapshot.acceleration
-    source_bonus = {"technical": 0.10, "pullback": 0.12, "sentiment": 0.08}.get(signal.source, 0.0)
-    return (
+    source_bonus = {"technical": 0.10, "pullback": 0.12, "sentiment": 0.08, "compression": 0.14, "reversal": 0.10}.get(signal.source, 0.0)
+    base = (
         signal.confidence
         + source_bonus
         + min(0.25, max(0.0, trend_value / 10.0))
         + min(0.20, max(0.0, sentiment_score * 0.5))
         + min(0.10, max(0.0, acceleration * 0.4))
-    ) * regime.risk_multiplier
+        + min(0.18, max(-0.12, relative_strength * 1.8))
+    )
+    return base * regime.risk_multiplier * execution_quality
 
 
 def sentiment_allows_entry(config: BotConfig, snapshot: Optional[SentimentSnapshot]) -> bool:
@@ -1462,7 +1611,7 @@ def execute_ranked_entries(
             allocated,
         )
         if buy_qty > 0:
-            buy_qty *= candidate.signal.confidence * candidate.regime.risk_multiplier
+            buy_qty *= candidate.signal.confidence * candidate.regime.risk_multiplier * candidate.execution_quality
         if buy_qty <= 0:
             set_snapshot_candidate_score(state, symbol, candidate.score)
             state["sym"][symbol]["snapshot"]["last_action"] = "size zero"
@@ -1517,7 +1666,8 @@ def execute_ranked_entries(
             f"order_id={order.id};source={candidate.signal.source};confidence={candidate.signal.confidence:.2f};"
             f"score={candidate.score:.3f};rsi={candidate.signal.rsi_value:.2f};vol_ratio={candidate.signal.volume_ratio:.2f};"
             f"atr={candidate.signal.atr_value:.6f};atr_pct={candidate.signal.atr_pct:.4f};"
-            f"ema_spread_pct={candidate.signal.ema_spread_pct:.4f};regime={candidate.regime.name};reason={candidate.signal.reason}"
+            f"ema_spread_pct={candidate.signal.ema_spread_pct:.4f};regime={candidate.regime.name};"
+            f"reason={candidate.signal.reason};exec_q={candidate.execution_quality:.3f};rs={candidate.relative_strength:.4f}"
         )
         if candidate.sentiment is not None:
             note += f";sentiment={candidate.sentiment.score:.3f};sentiment_accel={candidate.sentiment.acceleration:.3f}"
@@ -1608,6 +1758,7 @@ def process_symbol(
     positions: Dict[str, BrokerPosition],
     open_order_symbols: Set[str],
     prices_now: Dict[str, float],
+    benchmark_context: Dict[str, List[float]],
 ) -> Optional[CandidateSetup]:
     sym_state = get_sym_state(state, symbol)
     position = positions.get(symbol)
@@ -1641,8 +1792,15 @@ def process_symbol(
     atr_live = atr(highs, lows, closes, config.atr_len)
     atr_pct_live = atr_live / max(closes[-1], 1e-9) if math.isfinite(atr_live) and atr_live > 0 else 0.0
     vol_ratio_live = volume_ratio(volumes, config.volume_window)
+    btc_benchmark = benchmark_context.get("BTC/USD")
+    eth_benchmark = benchmark_context.get("ETH/USD")
+    benchmark = btc_benchmark if symbol != "BTC/USD" else eth_benchmark
+    rel_strength = relative_strength_score(closes, benchmark, config.rs_lookback)
+    execution_quality = estimate_execution_quality(symbol, atr_pct_live, vol_ratio_live)
     breakout_signal = build_entry_signal(config, closes, highs, lows, volumes)
     pullback_signal = build_pullback_entry_signal(config, closes, highs, lows, volumes)
+    compression_signal = build_compression_breakout_signal(config, closes, highs, lows, volumes)
+    reversal_signal = build_failed_breakdown_signal(config, closes, highs, lows, volumes)
     entry_signal = breakout_signal
     sentiment_snapshot: Optional[SentimentSnapshot] = None
     if sentiment_client.is_active():
@@ -1680,6 +1838,8 @@ def process_symbol(
             entry_signal=entry_signal,
             last_action=action_label,
             regime=regime,
+            relative_strength=rel_strength,
+            execution_quality=execution_quality,
         )
         log_line(config, f"{symbol} muted (startup)")
         sym_state["prev_price"] = last
@@ -1699,6 +1859,8 @@ def process_symbol(
             entry_signal=entry_signal,
             last_action=action_label,
             regime=regime,
+            relative_strength=rel_strength,
+            execution_quality=execution_quality,
         )
         log_line(config, f"{symbol} has open orders; waiting.")
         sym_state["prev_price"] = last
@@ -1710,9 +1872,13 @@ def process_symbol(
             setup_options.append(breakout_signal)
         if pullback_signal and regime.allow_pullback:
             setup_options.append(pullback_signal)
+        if compression_signal and regime.allow_breakout:
+            setup_options.append(compression_signal)
+        if reversal_signal and regime.allow_trend:
+            setup_options.append(reversal_signal)
 
         if not trend_ok and regime.allow_trend:
-            setup_options = [signal for signal in setup_options if signal.source == "sentiment"]
+            setup_options = [signal for signal in setup_options if signal.source in {"sentiment", "reversal"}]
 
         if not can_open_new_risk(config, state):
             action_label = "halted"
@@ -1737,6 +1903,8 @@ def process_symbol(
                     entry_signal=entry_signal,
                     last_action=action_label,
                     regime=regime,
+                    relative_strength=rel_strength,
+                    execution_quality=execution_quality,
                 )
                 log_line(config, f"{symbol} sentiment did not confirm long entry.")
                 sym_state["prev_price"] = last
@@ -1750,14 +1918,20 @@ def process_symbol(
 
         ranked_setups = sorted(
             setup_options,
-            key=lambda signal: score_setup(signal, trend_value, sentiment_snapshot, regime),
+            key=lambda signal: score_setup(signal, trend_value, sentiment_snapshot, regime, rel_strength, execution_quality),
             reverse=True,
         )
         entry_signal = ranked_setups[0] if ranked_setups else None
 
         candidate: Optional[CandidateSetup] = None
-        if entry_signal and can_fire(config, sym_state) and (trend_ok or entry_signal.source == "sentiment"):
-            candidate_score = score_setup(entry_signal, trend_value, sentiment_snapshot, regime)
+        if (
+            entry_signal
+            and can_fire(config, sym_state)
+            and (trend_ok or entry_signal.source in {"sentiment", "reversal"})
+            and rel_strength >= config.min_relative_strength
+            and execution_quality >= config.min_execution_quality
+        ):
+            candidate_score = score_setup(entry_signal, trend_value, sentiment_snapshot, regime, rel_strength, execution_quality)
             candidate = CandidateSetup(
                 symbol=symbol,
                 signal=entry_signal,
@@ -1767,6 +1941,8 @@ def process_symbol(
                 sector=sector_for_symbol(symbol),
                 score=candidate_score,
                 last_price=last,
+                execution_quality=execution_quality,
+                relative_strength=rel_strength,
             )
             set_snapshot_candidate_score(state, symbol, candidate_score)
             action_label = f"candidate {entry_signal.source}"
@@ -1783,7 +1959,7 @@ def process_symbol(
             )
         else:
             if action_label == "watch":
-                action_label = "no setup"
+                action_label = "no setup" if rel_strength >= config.min_relative_strength else "weak rs"
             log_line(config, f"{symbol} no valid setup. regime={regime.name}")
 
         update_symbol_snapshot(
@@ -1797,6 +1973,8 @@ def process_symbol(
             entry_signal=entry_signal,
             last_action=action_label,
             regime=regime,
+            relative_strength=rel_strength,
+            execution_quality=execution_quality,
         )
         sym_state["prev_price"] = last
         return candidate
@@ -1903,6 +2081,8 @@ def process_symbol(
         entry_signal=entry_signal,
         last_action=action_label,
         regime=regime,
+        relative_strength=rel_strength,
+        execution_quality=execution_quality,
     )
     sym_state["prev_price"] = last
     return None
@@ -1934,6 +2114,16 @@ def run_once(
     reconcile_positions_with_state(config, state, symbols, positions)
     prices_now: Dict[str, float] = {}
     candidates: List[CandidateSetup] = []
+    benchmark_context: Dict[str, List[float]] = {}
+    for benchmark_symbol in ("BTC/USD", "ETH/USD"):
+        if benchmark_symbol in symbols:
+            try:
+                benchmark_context[benchmark_symbol] = data_client.fetch_htf_closes(
+                    benchmark_symbol,
+                    max(config.warmup_htf, config.htf_slow + config.htf_slope_n + 5),
+                )
+            except Exception as exc:
+                log_line(config, f"{benchmark_symbol} benchmark fetch failed: {type(exc).__name__}: {exc}")
     meta["portfolio_heat"] = portfolio_heat(positions, state, prices_now, account.equity)
     meta["sector_exposure"] = sector_exposure(positions, prices_now, account.equity)
 
@@ -1951,6 +2141,7 @@ def run_once(
                 positions=positions,
                 open_order_symbols=open_order_symbols,
                 prices_now=prices_now,
+                benchmark_context=benchmark_context,
             )
             if candidate is not None:
                 candidates.append(candidate)
