@@ -13,8 +13,32 @@
       "denylist": ["secgovparody", "fake_secgov"]
     },
     {
+      "username": "EricBalchunas",
+      "display_name": "Eric Balchunas",
+      "category": "etf/news reporters",
+      "priority": 1.45,
+      "reliability": 1.35,
+      "enabled": true,
+      "related_assets": ["BTC/USD", "ETH/USD"],
+      "tags": ["etf", "flows", "approval"],
+      "aliases": ["ericbalchunas"],
+      "denylist": ["ericbalchunasparody"]
+    },
+    {
+      "username": "JSeyff",
+      "display_name": "James Seyffart",
+      "category": "etf/news reporters",
+      "priority": 1.4,
+      "reliability": 1.3,
+      "enabled": true,
+      "related_assets": ["BTC/USD", "ETH/USD"],
+      "tags": ["etf", "sec", "approval"],
+      "aliases": ["jseyff"],
+      "denylist": ["jseyffart_fake"]
+    },
+    {
       "username": "tier10k",
-      "display_name": "tier10k",
+      "display_name": "db",
       "category": "etf/news reporters",
       "priority": 1.35,
       "reliability": 1.25,
@@ -23,6 +47,30 @@
       "tags": ["etf", "breaking"],
       "aliases": ["tier10k"],
       "denylist": ["tier10kparody"]
+    },
+    {
+      "username": "zachxbt",
+      "display_name": "ZachXBT",
+      "category": "investigators",
+      "priority": 1.45,
+      "reliability": 1.4,
+      "enabled": true,
+      "related_assets": ["BTC/USD", "ETH/USD", "SOL/USD"],
+      "tags": ["hack", "exploit", "investigation"],
+      "aliases": ["zachxbt"],
+      "denylist": ["zackxbt", "zachxbt_parody"]
+    },
+    {
+      "username": "lookonchain",
+      "display_name": "Lookonchain",
+      "category": "onchain",
+      "priority": 1.15,
+      "reliability": 1.05,
+      "enabled": true,
+      "related_assets": ["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD"],
+      "tags": ["whales", "flows", "liquidation"],
+      "aliases": ["lookonchain"],
+      "denylist": ["lookonchainnews", "lookonchain_fake"]
     },
     {
       "username": "coinbaseassets",
@@ -35,6 +83,30 @@
       "tags": ["listing", "delisting"],
       "aliases": ["coinbaseassets"],
       "denylist": ["coinbaseassetss"]
+    },
+    {
+      "username": "binance",
+      "display_name": "Binance",
+      "category": "exchanges",
+      "priority": 1.25,
+      "reliability": 1.15,
+      "enabled": true,
+      "related_assets": ["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD", "XRP/USD"],
+      "tags": ["listing", "delisting", "reserve", "exchange"],
+      "aliases": ["binance"],
+      "denylist": ["binancepromoter", "binance_fan"]
+    },
+    {
+      "username": "a16zcrypto",
+      "display_name": "a16z crypto",
+      "category": "founders",
+      "priority": 1.05,
+      "reliability": 1.05,
+      "enabled": true,
+      "related_assets": ["ETH/USD", "SOL/USD", "LINK/USD"],
+      "tags": ["adoption", "partnership", "ecosystem"],
+      "aliases": ["a16zcrypto"],
+      "denylist": ["ai16znews"]
     }
   ]
 }
