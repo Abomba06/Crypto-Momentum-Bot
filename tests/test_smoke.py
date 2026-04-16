@@ -99,6 +99,9 @@ def make_config(case_name: str) -> crypto_trader.BotConfig:
         reentry_window_secs=1800,
         max_reentries_per_symbol=1,
         strategy_kill_switch_enabled=True,
+        max_theme_exposure=0.28,
+        correlation_penalty_same_sector=0.88,
+        correlation_penalty_same_theme=0.78,
     )
 
 
@@ -215,6 +218,16 @@ class StrategySmokeTests(unittest.TestCase):
         context = crypto_trader.compute_cross_asset_context(config, {"BTC/USD": btc, "ETH/USD": eth})
         self.assertEqual(context.regime, "risk-on")
         self.assertGreater(context.alts_multiplier, 1.0)
+
+    def test_theme_exposure_groups_symbols_by_narrative(self):
+        prices_now = {"SOL/USD": 100.0, "AVAX/USD": 50.0}
+        positions = {
+            "SOL/USD": crypto_trader.BrokerPosition("SOL/USD", 1.0, 1.0, 95.0, 100.0, 100.0),
+            "AVAX/USD": crypto_trader.BrokerPosition("AVAX/USD", 2.0, 2.0, 48.0, 50.0, 100.0),
+        }
+        exposure = crypto_trader.theme_exposure(positions, prices_now, 1000.0)
+        self.assertIn("high-beta-layer1", exposure)
+        self.assertAlmostEqual(exposure["high-beta-layer1"], 0.2, places=6)
 
     def test_failed_breakdown_signal_can_trigger(self):
         config = make_config("reversal")
@@ -350,8 +363,8 @@ class StrategySmokeTests(unittest.TestCase):
 
     def test_build_research_report_aggregates_closed_trades(self):
         state = crypto_trader.default_state(100000.0)
-        crypto_trader.update_trade_stats(state, "BTC/USD", "technical", "trend", 120.0, 3.2)
-        crypto_trader.update_trade_stats(state, "ETH/USD", "pullback", "trend", -50.0, -1.1)
+        crypto_trader.update_trade_stats(state, "BTC/USD", "technical", "trend", 120.0, 3.2, {"theme": "store-of-value", "liquidity_tier": "liquid", "cross_asset_regime": "risk-on", "relative_strength_bucket": "strong", "execution_quality_bucket": "elite"})
+        crypto_trader.update_trade_stats(state, "ETH/USD", "pullback", "trend", -50.0, -1.1, {"theme": "smart-contracts", "liquidity_tier": "liquid", "cross_asset_regime": "neutral", "relative_strength_bucket": "mixed", "execution_quality_bucket": "good"})
         report = crypto_trader.build_research_report(state)
         self.assertEqual(report["closed_trades"], 2)
         self.assertIn("technical", report["by_source"])
@@ -359,6 +372,8 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertIn("BTC/USD", report["by_symbol"])
         self.assertIn("expectancy", report)
         self.assertIn("health", report)
+        self.assertIn("by_feature", report)
+        self.assertIn("store-of-value", report["by_feature"]["theme"])
 
     def test_build_research_report_flags_degraded_health_when_expectancy_is_negative(self):
         state = crypto_trader.default_state(100000.0)
@@ -442,6 +457,7 @@ class StrategySmokeTests(unittest.TestCase):
             relative_strength=0.05,
             cross_asset_multiplier=1.04,
             liquidity_tier="liquid",
+            theme="store-of-value",
         )
         crypto_trader.get_sym_state(state, "BTC/USD")["snapshot"] = {"symbol": "BTC/USD", "last_action": "watch"}
         broker = FakeBroker()

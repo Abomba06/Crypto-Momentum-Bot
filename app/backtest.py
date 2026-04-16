@@ -57,6 +57,9 @@ class BacktestConfig:
     reentry_window_secs: int = 1800
     max_reentries_per_symbol: int = 1
     strategy_kill_switch_enabled: bool = True
+    max_theme_exposure: float = 0.28
+    correlation_penalty_same_sector: float = 0.88
+    correlation_penalty_same_theme: float = 0.78
 
     @property
     def warmup_ltf(self) -> int:
@@ -149,6 +152,9 @@ def as_runtime_config(config: BacktestConfig) -> Any:
         reentry_window_secs=config.reentry_window_secs,
         max_reentries_per_symbol=config.max_reentries_per_symbol,
         strategy_kill_switch_enabled=config.strategy_kill_switch_enabled,
+        max_theme_exposure=config.max_theme_exposure,
+        correlation_penalty_same_sector=config.correlation_penalty_same_sector,
+        correlation_penalty_same_theme=config.correlation_penalty_same_theme,
     )
 
 
@@ -212,6 +218,9 @@ def portfolio_runtime_config(config: BacktestConfig) -> Any:
     runtime.reentry_window_secs = config.reentry_window_secs
     runtime.max_reentries_per_symbol = config.max_reentries_per_symbol
     runtime.strategy_kill_switch_enabled = config.strategy_kill_switch_enabled
+    runtime.max_theme_exposure = config.max_theme_exposure
+    runtime.correlation_penalty_same_sector = config.correlation_penalty_same_sector
+    runtime.correlation_penalty_same_theme = config.correlation_penalty_same_theme
     return runtime
 
 
@@ -552,6 +561,7 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                     relative_strength=rel_strength,
                     cross_asset_multiplier=crypto_trader.cross_asset_multiplier(symbol, cross_asset) * cross_asset.risk_multiplier,
                     liquidity_tier=crypto_trader.liquidity_tier(symbol),
+                    theme=crypto_trader.theme_for_symbol(symbol),
                 )
             )
 

@@ -40,6 +40,20 @@ SECTOR_MAP = {
     "XRP/USD": "payments",
 }
 
+THEME_MAP = {
+    "BTC/USD": "store-of-value",
+    "ETH/USD": "smart-contracts",
+    "SOL/USD": "high-beta-layer1",
+    "AVAX/USD": "high-beta-layer1",
+    "ADA/USD": "high-beta-layer1",
+    "MATIC/USD": "scaling",
+    "DOGE/USD": "meme",
+    "LINK/USD": "oracle-infra",
+    "UNI/USD": "defi",
+    "LTC/USD": "payments",
+    "XRP/USD": "payments",
+}
+
 SPREAD_BPS_MAP = {
     "BTC/USD": 4.0,
     "ETH/USD": 5.0,
@@ -175,6 +189,9 @@ class BotConfig:
     reentry_window_secs: int
     max_reentries_per_symbol: int
     strategy_kill_switch_enabled: bool
+    max_theme_exposure: float
+    correlation_penalty_same_sector: float
+    correlation_penalty_same_theme: float
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -311,6 +328,9 @@ class BotConfig:
             reentry_window_secs=int(os.getenv("REENTRY_WINDOW_SECS", "1800")),
             max_reentries_per_symbol=int(os.getenv("MAX_REENTRIES_PER_SYMBOL", "1")),
             strategy_kill_switch_enabled=os.getenv("STRATEGY_KILL_SWITCH_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
+            max_theme_exposure=float(os.getenv("MAX_THEME_EXPOSURE", "0.28")),
+            correlation_penalty_same_sector=float(os.getenv("CORRELATION_PENALTY_SAME_SECTOR", "0.88")),
+            correlation_penalty_same_theme=float(os.getenv("CORRELATION_PENALTY_SAME_THEME", "0.78")),
         )
 
 
@@ -371,6 +391,7 @@ class CandidateSetup:
     relative_strength: float
     cross_asset_multiplier: float
     liquidity_tier: str
+    theme: str
 
 
 @dataclass(frozen=True)
@@ -531,6 +552,10 @@ def print_dashboard(
         f"Daily halt: {'ON' if daily.get('halt', False) else 'off'} | Weekly halt: {'ON' if state.get('weekly', {}).get('halt', False) else 'off'} | Strategy halt: {'ON' if state.get('meta', {}).get('strategy_halt', False) else 'off'} | Open order symbols: {', '.join(sorted(open_order_symbols)) if open_order_symbols else 'none'}",
         f"Portfolio heat: {safe_float(state.get('meta', {}).get('portfolio_heat')):.2%} | Loss streak: {int(state.get('meta', {}).get('consecutive_losses', 0))} | Candidates: {int(state.get('meta', {}).get('candidate_count', 0))}",
     ]
+    theme_exposure_map = state.get("meta", {}).get("theme_exposure", {})
+    if theme_exposure_map:
+        top_theme = max(theme_exposure_map.items(), key=lambda item: item[1])
+        lines.append(f"Theme concentration: {top_theme[0]} {safe_float(top_theme[1]):.2%}")
     cross_asset = state.get("meta", {}).get("cross_asset", {})
     if cross_asset:
         lines.append(
@@ -1129,6 +1154,10 @@ def sector_for_symbol(symbol: str) -> str:
     return SECTOR_MAP.get(symbol, "other")
 
 
+def theme_for_symbol(symbol: str) -> str:
+    return THEME_MAP.get(symbol, sector_for_symbol(symbol))
+
+
 def liquidity_tier(symbol: str) -> str:
     return LIQUIDITY_TIER_MAP.get(symbol, "thin" if SPREAD_BPS_MAP.get(symbol, 12.0) >= 10.0 else "standard")
 
@@ -1223,6 +1252,42 @@ def sector_exposure(positions: Dict[str, BrokerPosition], prices_now: Dict[str, 
     return exposures
 
 
+def theme_exposure(positions: Dict[str, BrokerPosition], prices_now: Dict[str, float], equity: float) -> Dict[str, float]:
+    exposures: Dict[str, float] = {}
+    if equity <= 0:
+        return exposures
+    for symbol, position in positions.items():
+        if position.qty <= 0:
+            continue
+        last = prices_now.get(symbol, position.current_price)
+        notional = abs(position.qty * last) if is_finite(last) else abs(position.market_value)
+        theme = theme_for_symbol(symbol)
+        exposures[theme] = exposures.get(theme, 0.0) + (notional / equity)
+    return exposures
+
+
+def correlation_overlap_multiplier(
+    config: BotConfig,
+    candidate: CandidateSetup,
+    existing_symbols: List[str],
+    accepted_candidates: List[CandidateSetup],
+) -> float:
+    multiplier = 1.0
+    for symbol in existing_symbols:
+        if sector_for_symbol(symbol) == candidate.sector:
+            multiplier *= config.correlation_penalty_same_sector
+        if theme_for_symbol(symbol) == candidate.theme:
+            multiplier *= config.correlation_penalty_same_theme
+    for accepted in accepted_candidates:
+        if accepted.symbol == candidate.symbol:
+            continue
+        if accepted.sector == candidate.sector:
+            multiplier *= config.correlation_penalty_same_sector
+        if accepted.theme == candidate.theme:
+            multiplier *= config.correlation_penalty_same_theme
+    return max(0.45, min(1.0, multiplier))
+
+
 def detect_regime(
     trend_ok: bool,
     trend_value: float,
@@ -1276,6 +1341,7 @@ def update_symbol_snapshot(
         "regime": None if regime is None else regime.name,
         "relative_strength": relative_strength,
         "execution_quality": execution_quality,
+        "theme": theme_for_symbol(symbol),
         "liquidity_tier": liquidity_tier(symbol),
         "cross_asset_regime": None if cross_asset is None else cross_asset.regime,
         "cross_asset_multiplier": 1.0 if cross_asset is None else cross_asset_multiplier(symbol, cross_asset),
@@ -1301,7 +1367,35 @@ def set_snapshot_candidate_score(state: Dict[str, Any], symbol: str, candidate_s
         snapshot["candidate_score"] = candidate_score
 
 
-def update_trade_stats(state: Dict[str, Any], symbol: str, source: str, regime: str, pnl_value: float, pnl_pct: float) -> None:
+def rs_bucket(value: float) -> str:
+    if value >= 0.06:
+        return "strong"
+    if value >= 0.0:
+        return "positive"
+    if value <= -0.04:
+        return "weak"
+    return "mixed"
+
+
+def execution_bucket(value: float) -> str:
+    if value >= 0.9:
+        return "elite"
+    if value >= 0.75:
+        return "good"
+    if value >= 0.6:
+        return "thin-ok"
+    return "fragile"
+
+
+def update_trade_stats(
+    state: Dict[str, Any],
+    symbol: str,
+    source: str,
+    regime: str,
+    pnl_value: float,
+    pnl_pct: float,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
     stats = state.setdefault("stats", {"closed": []})
     record = {
         "ts": now_utc().isoformat(),
@@ -1311,6 +1405,8 @@ def update_trade_stats(state: Dict[str, Any], symbol: str, source: str, regime: 
         "pnl_value": pnl_value,
         "pnl_pct": pnl_pct,
     }
+    if metadata:
+        record.update(metadata)
     closed = stats.setdefault("closed", [])
     closed.append(record)
     if len(closed) > 500:
@@ -1339,6 +1435,14 @@ def summarize_bucket(records: List[Dict[str, Any]]) -> Dict[str, float]:
         "gross_wins": gross_wins,
         "gross_losses": gross_losses,
     }
+
+
+def summarize_feature(records: List[Dict[str, Any]], field: str) -> Dict[str, Dict[str, float]]:
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    for item in records:
+        key = str(item.get(field, "unknown"))
+        buckets.setdefault(key, []).append(item)
+    return {key: summarize_bucket(items) for key, items in buckets.items()}
 
 
 def build_parameter_health(
@@ -1417,6 +1521,18 @@ def build_runtime_alerts(config: BotConfig, state: Dict[str, Any], report: Dict[
     return alerts[:6]
 
 
+def trade_metadata_from_state(sym_state: Dict[str, Any]) -> Dict[str, Any]:
+    rel_strength = safe_float(sym_state.get("entry_relative_strength"))
+    execution_quality = safe_float(sym_state.get("entry_execution_quality"), 1.0)
+    return {
+        "theme": sym_state.get("entry_theme", "unknown"),
+        "cross_asset_regime": sym_state.get("entry_cross_asset_regime", "neutral"),
+        "liquidity_tier": sym_state.get("entry_liquidity_tier", "unknown"),
+        "relative_strength_bucket": rs_bucket(rel_strength),
+        "execution_quality_bucket": execution_bucket(execution_quality),
+    }
+
+
 def update_strategy_health_halt(config: BotConfig, state: Dict[str, Any], report: Dict[str, Any]) -> None:
     meta = state.setdefault("meta", {})
     if not config.strategy_kill_switch_enabled:
@@ -1456,6 +1572,13 @@ def build_research_report(state: Dict[str, Any]) -> Dict[str, Any]:
     by_symbol = {key: summarize_bucket(records) for key, records in by_symbol_records.items()}
     by_hour = {key: summarize_bucket(records) for key, records in by_hour_records.items()}
     health = build_parameter_health(summary, by_source, by_regime)
+    by_feature = {
+        "theme": summarize_feature(closed, "theme"),
+        "liquidity_tier": summarize_feature(closed, "liquidity_tier"),
+        "cross_asset_regime": summarize_feature(closed, "cross_asset_regime"),
+        "relative_strength_bucket": summarize_feature(closed, "relative_strength_bucket"),
+        "execution_quality_bucket": summarize_feature(closed, "execution_quality_bucket"),
+    }
     return {
         "generated_at": now_utc().isoformat(),
         "closed_trades": summary["count"],
@@ -1468,6 +1591,7 @@ def build_research_report(state: Dict[str, Any]) -> Dict[str, Any]:
         "by_regime": by_regime,
         "by_symbol": by_symbol,
         "by_hour": by_hour,
+        "by_feature": by_feature,
         "health": health,
         "loss_streak": int(state.get("meta", {}).get("consecutive_losses", 0)),
         "reconciliation": state.get("meta", {}).get("reconciliation", {}),
@@ -1977,7 +2101,10 @@ def execute_ranked_entries(
     allocated = total_notional(positions, prices_now)
     heat_now = portfolio_heat(positions, state, prices_now, account.equity)
     sector_now = sector_exposure(positions, prices_now, account.equity)
+    theme_now = theme_exposure(positions, prices_now, account.equity)
     entries_taken = 0
+    accepted_candidates: List[CandidateSetup] = []
+    existing_symbols = [symbol for symbol, position in positions.items() if position.qty > 0]
 
     for candidate in ranked:
         if entries_taken >= config.max_entries_per_loop:
@@ -2001,12 +2128,14 @@ def execute_ranked_entries(
             allocated,
         )
         if buy_qty > 0:
+            overlap_multiplier = correlation_overlap_multiplier(config, candidate, existing_symbols, accepted_candidates)
             buy_qty *= (
                 candidate.signal.confidence
                 * candidate.regime.risk_multiplier
                 * candidate.execution_quality
                 * candidate.cross_asset_multiplier
                 * liquidity_size_multiplier(config, symbol)
+                * overlap_multiplier
             )
         if buy_qty <= 0:
             set_snapshot_candidate_score(state, symbol, candidate.score)
@@ -2043,6 +2172,20 @@ def execute_ranked_entries(
                 "sector_exposure",
             )
             continue
+        if theme_now.get(candidate.theme, 0.0) + (proposed_notional / max(account.equity, 1e-9)) > config.max_theme_exposure:
+            state["sym"][symbol]["snapshot"]["last_action"] = "theme cap"
+            write_signal_journal(
+                config,
+                symbol,
+                candidate.signal.source,
+                candidate.regime.name,
+                candidate.score,
+                None if candidate.sentiment is None else candidate.sentiment.score,
+                candidate.trend_score,
+                "rejected",
+                "theme_exposure",
+            )
+            continue
 
         order, submitted_qty, error_message = submit_order_with_safeguards(config, broker, sym_state, symbol, "buy", buy_qty)
         if order is None:
@@ -2067,6 +2210,11 @@ def execute_ranked_entries(
         sym_state["last_entry_price"] = candidate.signal.breakout_level
         sym_state["entry_source"] = candidate.signal.source
         sym_state["entry_regime"] = candidate.regime.name
+        sym_state["entry_theme"] = candidate.theme
+        sym_state["entry_cross_asset_regime"] = state.get("meta", {}).get("cross_asset", {}).get("regime", "neutral")
+        sym_state["entry_liquidity_tier"] = candidate.liquidity_tier
+        sym_state["entry_relative_strength"] = candidate.relative_strength
+        sym_state["entry_execution_quality"] = candidate.execution_quality
         sym_state["live_stop"] = candidate.signal.stop
         clear_reentry_state(sym_state)
         set_fired(sym_state)
@@ -2074,7 +2222,9 @@ def execute_ranked_entries(
         allocated += submitted_qty * candidate.signal.breakout_level
         heat_now += (max(0.0, candidate.signal.breakout_level - candidate.signal.stop) * submitted_qty) / max(account.equity, 1e-9)
         sector_now[candidate.sector] = sector_now.get(candidate.sector, 0.0) + ((submitted_qty * candidate.signal.breakout_level) / max(account.equity, 1e-9))
+        theme_now[candidate.theme] = theme_now.get(candidate.theme, 0.0) + ((submitted_qty * candidate.signal.breakout_level) / max(account.equity, 1e-9))
         state.setdefault("meta", {})["entries_this_loop"] = entries_taken
+        accepted_candidates.append(candidate)
 
         note = (
             f"order_id={order.id};source={candidate.signal.source};confidence={candidate.signal.confidence:.2f};"
@@ -2390,6 +2540,7 @@ def process_symbol(
                 relative_strength=rel_strength,
                 cross_asset_multiplier=symbol_cross_asset_factor,
                 liquidity_tier=symbol_liquidity_tier,
+                theme=theme_for_symbol(symbol),
             )
             set_snapshot_candidate_score(state, symbol, candidate_score)
             action_label = f"candidate {entry_signal.source}"
@@ -2448,7 +2599,7 @@ def process_symbol(
             action_label = "sell sentiment"
             pnl_value = (last - position.avg_entry_price) * submitted_qty
             pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
-            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct)
+            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct, trade_metadata_from_state(sym_state))
             write_trade(
                 config,
                 symbol,
@@ -2481,7 +2632,7 @@ def process_symbol(
                 action_label = "take profit 1"
                 pnl_value = (last - position.avg_entry_price) * submitted_qty
                 pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
-                update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct)
+                update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct, trade_metadata_from_state(sym_state))
                 write_trade(config, symbol, "TP1_SUBMITTED", last, position.avg_entry_price, stop, tp1, tp2, submitted_qty, f"order_id={order.id};pnl_value={pnl_value:.4f};pnl_pct={pnl_pct:.3f}")
                 log_line(config, f"{symbol} TP1 submitted qty={submitted_qty:.8f}")
 
@@ -2496,7 +2647,7 @@ def process_symbol(
             action_label = "take profit 2"
             pnl_value = (last - position.avg_entry_price) * submitted_qty
             pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
-            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct)
+            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct, trade_metadata_from_state(sym_state))
             write_trade(
                 config,
                 symbol,
@@ -2522,7 +2673,7 @@ def process_symbol(
             action_label = "stop exit"
             pnl_value = (last - position.avg_entry_price) * submitted_qty
             pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
-            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct)
+            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct, trade_metadata_from_state(sym_state))
             write_trade(
                 config,
                 symbol,
@@ -2603,6 +2754,7 @@ def run_once(
     }
     meta["portfolio_heat"] = portfolio_heat(positions, state, prices_now, account.equity)
     meta["sector_exposure"] = sector_exposure(positions, prices_now, account.equity)
+    meta["theme_exposure"] = theme_exposure(positions, prices_now, account.equity)
 
     for symbol in symbols:
         try:
@@ -2647,6 +2799,7 @@ def run_once(
     state["equity"] = account.equity
     meta["portfolio_heat"] = portfolio_heat(positions, state, prices_now, max(account.equity, 1e-9))
     meta["sector_exposure"] = sector_exposure(positions, prices_now, max(account.equity, 1e-9))
+    meta["theme_exposure"] = theme_exposure(positions, prices_now, max(account.equity, 1e-9))
     report = build_research_report(state)
     update_strategy_health_halt(config, state, report)
     meta["alerts"] = build_runtime_alerts(config, state, report)
