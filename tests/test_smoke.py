@@ -2,6 +2,8 @@ import unittest
 from datetime import timedelta
 from pathlib import Path
 
+import pandas as pd
+
 from app import backtest, crypto_trader
 from app import sentiment
 
@@ -67,6 +69,19 @@ def make_config(case_name: str) -> crypto_trader.BotConfig:
         sentiment_news_limit=8,
         sentiment_twitter_limit=8,
         sentiment_twitter_rss_url="https://nitter.net/search/rss?f=tweets&q={query}",
+        max_breakout_atr_extension=0.8,
+        max_entry_rsi=72.0,
+        ema_slope_lookback=3,
+        dashboard_symbols=10,
+        max_entries_per_loop=2,
+        max_portfolio_heat=0.06,
+        max_sector_exposure=0.35,
+        weekly_dd_limit=0.10,
+        max_consecutive_losses=4,
+        pullback_ema_buffer_atr=0.35,
+        shock_sentiment_threshold=-0.55,
+        signals_csv=root / "signals.csv",
+        research_report=root / "research_report.json",
     )
 
 
@@ -89,7 +104,7 @@ class StrategySmokeTests(unittest.TestCase):
 
     def test_build_entry_signal_requires_breakout_conditions(self):
         config = make_config("entry_signal")
-        closes = [100 + i * 0.2 for i in range(80)]
+        closes = [100 + ((i % 4) * 0.15) + i * 0.03 for i in range(80)]
         highs = [c + 0.8 for c in closes]
         lows = [c - 0.7 for c in closes]
         volumes = [100.0] * 79 + [160.0]
@@ -97,6 +112,7 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertIsNotNone(signal)
         self.assertGreater(signal.tp2, signal.tp1)
         self.assertGreater(signal.tp1, signal.breakout_level)
+        self.assertLessEqual(signal.confidence, 1.0)
 
     def test_can_fire_uses_cooldown(self):
         config = make_config("cooldown")
@@ -105,7 +121,7 @@ class StrategySmokeTests(unittest.TestCase):
 
     def test_build_sentiment_entry_signal_uses_atr_guardrails(self):
         config = make_config("sentiment_entry")
-        closes = [100 + i * 0.25 for i in range(80)]
+        closes = [100 + ((i % 4) * 0.15) + i * 0.03 for i in range(80)]
         highs = [c + 1.0 for c in closes]
         lows = [c - 0.9 for c in closes]
         volumes = [100.0] * 80
@@ -124,6 +140,9 @@ class StrategySmokeTests(unittest.TestCase):
             sample_size=5,
             source_counts={"news": 5},
             items=[],
+            top_headlines=["ETF approval drives rally"],
+            event_counts={"approval": 1},
+            acceleration=0.2,
             updated_at=crypto_trader.now_utc(),
         )
         bearish = sentiment.SentimentSnapshot(
@@ -133,6 +152,9 @@ class StrategySmokeTests(unittest.TestCase):
             sample_size=5,
             source_counts={"news": 5},
             items=[],
+            top_headlines=["Hack triggers sell-off"],
+            event_counts={"hack": 1},
+            acceleration=-0.2,
             updated_at=crypto_trader.now_utc(),
         )
         self.assertTrue(crypto_trader.sentiment_allows_entry(config, bullish))
@@ -141,6 +163,195 @@ class StrategySmokeTests(unittest.TestCase):
     def test_sentiment_scoring_moves_with_headline_tone(self):
         self.assertGreater(sentiment.score_text("Bitcoin rally surge after approval"), 0.0)
         self.assertLess(sentiment.score_text("Bitcoin crash after lawsuit and hack"), 0.0)
+
+    def test_entry_signal_rejects_overextended_breakout(self):
+        config = make_config("overextended")
+        closes = [100 + i * 0.2 for i in range(79)] + [130.0]
+        highs = [c + 1.0 for c in closes]
+        lows = [c - 0.9 for c in closes]
+        volumes = [100.0] * 79 + [200.0]
+        signal = crypto_trader.build_entry_signal(config, closes, highs, lows, volumes)
+        self.assertIsNone(signal)
+
+    def test_detect_regime_flags_panic(self):
+        snapshot = sentiment.SentimentSnapshot(
+            symbol="BTC/USD",
+            score=-0.8,
+            label="bearish",
+            sample_size=4,
+            source_counts={"news": 4},
+            items=[],
+            top_headlines=["Exchange hack sparks panic"],
+            event_counts={"hack": 1},
+            acceleration=-0.4,
+            updated_at=crypto_trader.now_utc(),
+        )
+        regime = crypto_trader.detect_regime(False, -1.5, 0.03, 1.4, snapshot)
+        self.assertEqual(regime.name, "panic")
+        self.assertFalse(regime.allow_breakout)
+
+    def test_sentiment_client_parses_event_counts_and_headlines(self):
+        class FakeResponse:
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                pass
+
+        class FakeSession:
+            def get(self, url, timeout=None):
+                return FakeResponse(
+                    """<?xml version='1.0'?><rss><channel>
+                    <item><title>Bitcoin ETF approval sparks rally - Reuters</title><description>Bitcoin rally after approval</description><pubDate>Wed, 15 Apr 2026 12:00:00 GMT</pubDate></item>
+                    <item><title>Bitcoin hack fears fade as recovery starts - Bloomberg</title><description>Bitcoin recovery after hack scare</description><pubDate>Wed, 15 Apr 2026 11:00:00 GMT</pubDate></item>
+                    <item><title>Bitcoin gains as adoption grows - CoinDesk</title><description>adoption growth and strong rebound</description><pubDate>Wed, 15 Apr 2026 10:00:00 GMT</pubDate></item>
+                    </channel></rss>"""
+                )
+
+        client = sentiment.SentimentClient(
+            FakeSession(),
+            enabled=True,
+            mode="confirm",
+            sources=["news"],
+            lookback_hours=48,
+            min_items=3,
+            bullish_threshold=0.15,
+            bearish_threshold=-0.15,
+            cache_secs=300,
+        )
+        snapshot = client.get_sentiment("BTC/USD", timeout=20)
+        self.assertIsNotNone(snapshot)
+        self.assertIn("approval", snapshot.event_counts)
+        self.assertGreaterEqual(len(snapshot.top_headlines), 1)
+
+    def test_build_research_report_aggregates_closed_trades(self):
+        state = crypto_trader.default_state(100000.0)
+        crypto_trader.update_trade_stats(state, "BTC/USD", "technical", "trend", 120.0, 3.2)
+        crypto_trader.update_trade_stats(state, "ETH/USD", "pullback", "trend", -50.0, -1.1)
+        report = crypto_trader.build_research_report(state)
+        self.assertEqual(report["closed_trades"], 2)
+        self.assertIn("technical", report["by_source"])
+        self.assertIn("trend", report["by_regime"])
+        self.assertIn("BTC/USD", report["by_symbol"])
+        self.assertIn("expectancy", report)
+
+    def test_execute_ranked_entries_respects_ranking_and_updates_state(self):
+        config = make_config("execute_ranked")
+        state = crypto_trader.default_state(100000.0)
+        account = crypto_trader.AccountSnapshot(cash=100000.0, equity=100000.0)
+        positions = {}
+        prices_now = {"BTC/USD": 100.0}
+
+        class FakeBroker:
+            def __init__(self):
+                self.orders = []
+
+            def submit_market_buy(self, symbol, qty):
+                self.orders.append((symbol, qty))
+                return type("Order", (), {"id": f"{symbol}-1"})()
+
+        btc_snapshot = sentiment.SentimentSnapshot(
+            symbol="BTC/USD",
+            score=0.4,
+            label="bullish",
+            sample_size=4,
+            source_counts={"news": 4},
+            items=[],
+            top_headlines=["ETF approval"],
+            event_counts={"approval": 1},
+            acceleration=0.2,
+            updated_at=crypto_trader.now_utc(),
+        )
+        candidate = crypto_trader.CandidateSetup(
+            symbol="BTC/USD",
+            signal=crypto_trader.EntrySignal(
+                breakout_level=100.0,
+                stop=95.0,
+                tp1=103.0,
+                tp2=106.0,
+                trail_anchor=96.0,
+                atr_value=2.0,
+                volume_ratio=1.2,
+                rsi_value=60.0,
+                source="technical",
+                confidence=0.9,
+                atr_pct=0.02,
+                ema_spread_pct=0.01,
+                reason="breakout",
+            ),
+            regime=crypto_trader.RegimeSnapshot("trend", 1.0, True, True, True, 1.0),
+            sentiment=btc_snapshot,
+            trend_score=2.0,
+            sector="majors",
+            score=1.6,
+            last_price=100.0,
+        )
+        crypto_trader.get_sym_state(state, "BTC/USD")["snapshot"] = {"symbol": "BTC/USD", "last_action": "watch"}
+        broker = FakeBroker()
+        crypto_trader.execute_ranked_entries(config, broker, state, account, positions, prices_now, [candidate], set())
+        self.assertEqual(len(broker.orders), 1)
+        self.assertEqual(state["sym"]["BTC/USD"]["entry_source"], "technical")
+
+    def test_reconcile_positions_clears_stale_state_when_broker_flat(self):
+        config = make_config("reconcile_flat")
+        state = crypto_trader.default_state(100000.0)
+        sym_state = crypto_trader.get_sym_state(state, "BTC/USD")
+        sym_state["last_entry_price"] = 100.0
+        sym_state["high_water"] = 105.0
+        sym_state["entry_source"] = "technical"
+        result = crypto_trader.reconcile_positions_with_state(config, state, ["BTC/USD"], {})
+        self.assertEqual(result["cleared"], 1)
+        self.assertIsNone(sym_state["entry_source"])
+
+    def test_reconcile_positions_restores_missing_state_from_live_position(self):
+        config = make_config("reconcile_live")
+        state = crypto_trader.default_state(100000.0)
+        position = crypto_trader.BrokerPosition(
+            symbol="BTC/USD",
+            qty=1.5,
+            qty_available=1.5,
+            avg_entry_price=101.0,
+            current_price=103.0,
+            market_value=154.5,
+        )
+        result = crypto_trader.reconcile_positions_with_state(config, state, ["BTC/USD"], {"BTC/USD": position})
+        self.assertEqual(result["restored"], 1)
+        self.assertEqual(state["sym"]["BTC/USD"]["last_entry_price"], 101.0)
+
+    def test_backtest_simulation_returns_metrics(self):
+        idx = pd.date_range("2024-01-01", periods=320, freq="D")
+        closes = [100 + ((i % 5) * 0.12) + i * 0.08 for i in range(len(idx))]
+        df = pd.DataFrame(
+            {
+                "open": closes,
+                "high": [c + 1.0 for c in closes],
+                "low": [c - 0.9 for c in closes],
+                "close": closes,
+                "volume": [1000 + (i % 7) * 50 for i in range(len(idx))],
+            },
+            index=idx,
+        )
+        result = backtest.simulate_strategy(df, backtest.BacktestConfig())
+        self.assertIn("metrics", result)
+        self.assertIn("ending_equity", result["metrics"])
+        self.assertGreater(len(result["equity_curve"]), 0)
+
+    def test_walk_forward_validate_returns_summary(self):
+        idx = pd.date_range("2023-01-01", periods=500, freq="D")
+        closes = [100 + ((i % 6) * 0.09) + i * 0.05 for i in range(len(idx))]
+        df = pd.DataFrame(
+            {
+                "open": closes,
+                "high": [c + 1.0 for c in closes],
+                "low": [c - 0.9 for c in closes],
+                "close": closes,
+                "volume": [1200 + (i % 9) * 40 for i in range(len(idx))],
+            },
+            index=idx,
+        )
+        result = backtest.walk_forward_validate(df, backtest.BacktestConfig(train_bars=200, test_bars=100))
+        self.assertIn("summary", result)
+        self.assertGreaterEqual(len(result["windows"]), 1)
 
 
 if __name__ == "__main__":

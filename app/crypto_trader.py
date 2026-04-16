@@ -26,6 +26,21 @@ from app.sentiment import SentimentClient, SentimentSnapshot, parse_keyword_map
 load_dotenv()
 
 
+SECTOR_MAP = {
+    "BTC/USD": "majors",
+    "ETH/USD": "majors",
+    "SOL/USD": "layer1",
+    "AVAX/USD": "layer1",
+    "ADA/USD": "layer1",
+    "MATIC/USD": "layer1",
+    "DOGE/USD": "memes",
+    "LINK/USD": "infrastructure",
+    "UNI/USD": "defi",
+    "LTC/USD": "payments",
+    "XRP/USD": "payments",
+}
+
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -102,6 +117,19 @@ class BotConfig:
     sentiment_news_limit: int
     sentiment_twitter_limit: int
     sentiment_twitter_rss_url: str
+    max_breakout_atr_extension: float
+    max_entry_rsi: float
+    ema_slope_lookback: int
+    dashboard_symbols: int
+    max_entries_per_loop: int
+    max_portfolio_heat: float
+    max_sector_exposure: float
+    weekly_dd_limit: float
+    max_consecutive_losses: int
+    pullback_ema_buffer_atr: float
+    shock_sentiment_threshold: float
+    signals_csv: pathlib.Path
+    research_report: pathlib.Path
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -178,6 +206,8 @@ class BotConfig:
             logs_dir=logs_dir,
             run_log=logs_dir / "run.log",
             trades_csv=logs_dir / "trades.csv",
+            signals_csv=logs_dir / "signals.csv",
+            research_report=logs_dir / "research_report.json",
             state_path=state_path,
             initial_cash=float(os.getenv("INITIAL_CASH", "100000")),
             daily_dd_limit=float(os.getenv("DAILY_DD_LIMIT", "1.0")),
@@ -208,6 +238,17 @@ class BotConfig:
                 "SENTIMENT_TWITTER_RSS_URL",
                 "https://nitter.net/search/rss?f=tweets&q={query}",
             ).strip(),
+            max_breakout_atr_extension=float(os.getenv("MAX_BREAKOUT_ATR_EXTENSION", "0.8")),
+            max_entry_rsi=float(os.getenv("MAX_ENTRY_RSI", "72")),
+            ema_slope_lookback=int(os.getenv("EMA_SLOPE_LOOKBACK", "3")),
+            dashboard_symbols=int(os.getenv("DASHBOARD_SYMBOLS", "10")),
+            max_entries_per_loop=int(os.getenv("MAX_ENTRIES_PER_LOOP", "2")),
+            max_portfolio_heat=float(os.getenv("MAX_PORTFOLIO_HEAT", "0.06")),
+            max_sector_exposure=float(os.getenv("MAX_SECTOR_EXPOSURE", "0.35")),
+            weekly_dd_limit=float(os.getenv("WEEKLY_DD_LIMIT", "0.10")),
+            max_consecutive_losses=int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4")),
+            pullback_ema_buffer_atr=float(os.getenv("PULLBACK_EMA_BUFFER_ATR", "0.35")),
+            shock_sentiment_threshold=float(os.getenv("SHOCK_SENTIMENT_THRESHOLD", "-0.55")),
         )
 
 
@@ -238,6 +279,32 @@ class EntrySignal:
     volume_ratio: float
     rsi_value: float
     source: str
+    confidence: float
+    atr_pct: float
+    ema_spread_pct: float
+    reason: str
+
+
+@dataclass(frozen=True)
+class RegimeSnapshot:
+    name: str
+    risk_multiplier: float
+    allow_trend: bool
+    allow_pullback: bool
+    allow_breakout: bool
+    exit_aggression: float
+
+
+@dataclass(frozen=True)
+class CandidateSetup:
+    symbol: str
+    signal: EntrySignal
+    regime: RegimeSnapshot
+    sentiment: Optional[SentimentSnapshot]
+    trend_score: float
+    sector: str
+    score: float
+    last_price: float
 
 
 def default_state(initial_cash: float) -> Dict[str, Any]:
@@ -246,6 +313,9 @@ def default_state(initial_cash: float) -> Dict[str, Any]:
         "equity": initial_cash,
         "sym": {},
         "daily": {},
+        "weekly": {},
+        "meta": {"last_loop_at": None, "last_equity": initial_cash, "consecutive_losses": 0},
+        "stats": {"closed": []},
     }
 
 
@@ -258,6 +328,15 @@ def ensure_trades_csv(config: BotConfig) -> None:
     header = ["ts", "symbol", "action", "price_last", "avg_entry", "stop", "tp1", "tp2", "qty", "note"]
     is_new = not config.trades_csv.exists()
     with config.trades_csv.open("a", newline="", encoding="utf-8") as file_obj:
+        writer = csv.writer(file_obj)
+        if is_new:
+            writer.writerow(header)
+
+
+def ensure_signals_csv(config: BotConfig) -> None:
+    header = ["ts", "symbol", "setup", "regime", "score", "sentiment", "trend_score", "action", "reason"]
+    is_new = not config.signals_csv.exists()
+    with config.signals_csv.open("a", newline="", encoding="utf-8") as file_obj:
         writer = csv.writer(file_obj)
         if is_new:
             writer.writerow(header)
@@ -293,6 +372,34 @@ def write_trade(
         )
 
 
+def write_signal_journal(
+    config: BotConfig,
+    symbol: str,
+    setup: str,
+    regime: str,
+    score: float,
+    sentiment_score: Optional[float],
+    trend_value: float,
+    action: str,
+    reason: str,
+) -> None:
+    ensure_signals_csv(config)
+    with config.signals_csv.open("a", newline="", encoding="utf-8") as file_obj:
+        csv.writer(file_obj).writerow(
+            [
+                now_utc().isoformat(),
+                symbol,
+                setup,
+                regime,
+                f"{safe_float(score):.4f}",
+                "" if sentiment_score is None else f"{safe_float(sentiment_score):.4f}",
+                f"{safe_float(trend_value):.4f}",
+                action,
+                reason,
+            ]
+        )
+
+
 def print_dashboard(
     config: BotConfig,
     state: Dict[str, Any],
@@ -300,12 +407,29 @@ def print_dashboard(
     open_order_symbols: Set[str],
 ) -> None:
     timestamp = now_utc().strftime("%Y-%m-%d %H:%M:%S UTC")
+    daily = state.get("daily", {})
+    start_equity = safe_float(daily.get("start_equity"), state["equity"])
+    day_return = ((state["equity"] / max(start_equity, 1e-9)) - 1.0) * 100.0
     lines = [
         "",
         f"[{timestamp}] Crypto bot running",
-        f"Equity: ${state['equity']:.2f} | Cash: ${state['cash']:.2f} | Universe: {len(config.symbols)} symbols",
-        f"Open order symbols: {', '.join(sorted(open_order_symbols)) if open_order_symbols else 'none'}",
+        f"Equity: ${state['equity']:.2f} | Cash: ${state['cash']:.2f} | Day PnL: {day_return:+.2f}% | Universe: {len(config.symbols)}",
+        f"Daily halt: {'ON' if daily.get('halt', False) else 'off'} | Weekly halt: {'ON' if state.get('weekly', {}).get('halt', False) else 'off'} | Open order symbols: {', '.join(sorted(open_order_symbols)) if open_order_symbols else 'none'}",
+        f"Portfolio heat: {safe_float(state.get('meta', {}).get('portfolio_heat')):.2%} | Loss streak: {int(state.get('meta', {}).get('consecutive_losses', 0))} | Candidates: {int(state.get('meta', {}).get('candidate_count', 0))}",
     ]
+    reconcile = state.get("meta", {}).get("reconciliation", {})
+    if reconcile:
+        lines.append(
+            f"Reconcile: restored={int(reconcile.get('restored', 0))} "
+            f"cleared={int(reconcile.get('cleared', 0))} adjusted={int(reconcile.get('mismatched_qty', 0))}"
+        )
+    top_candidates = state.get("meta", {}).get("top_candidates", [])
+    if top_candidates:
+        top_line = ", ".join(
+            f"{item.get('symbol')} {item.get('setup')} {safe_float(item.get('score')):.2f}"
+            for item in top_candidates[:3]
+        )
+        lines.append(f"Top candidates: {top_line}")
 
     active_positions = [position for position in positions.values() if position.qty > 0]
     if active_positions:
@@ -317,6 +441,49 @@ def print_dashboard(
             )
     else:
         lines.append("Open positions: none")
+
+    snapshots = []
+    for symbol in config.symbols:
+        snapshot = state.get("sym", {}).get(symbol, {}).get("snapshot")
+        if snapshot:
+            snapshots.append(snapshot)
+
+    if snapshots:
+        lines.append("Symbol monitor:")
+        header = "  Symbol    Last      Pos$    UPNL%  Regime   Trend  Sentiment          Setup         Action"
+        lines.append(header)
+        lines.append("  " + "-" * (len(header) - 2))
+        ranked = sorted(
+            snapshots,
+            key=lambda item: (
+                item.get("has_position", False),
+                item.get("entry_ready", False),
+                safe_float(item.get("sentiment_score"), -9.0),
+                safe_float(item.get("trend_score"), -9.0),
+            ),
+            reverse=True,
+        )
+        for snapshot in ranked[: max(1, config.dashboard_symbols)]:
+            sentiment_text = snapshot.get("sentiment_label", "n/a")
+            sentiment_score = snapshot.get("sentiment_score")
+            if sentiment_score is not None and math.isfinite(float(sentiment_score)):
+                sentiment_text = f"{sentiment_text} {float(sentiment_score):+.2f}"
+            unrealized = snapshot.get("unrealized_pct")
+            pnl_text = "--"
+            if unrealized is not None and math.isfinite(float(unrealized)):
+                pnl_text = f"{float(unrealized):+5.2f}"
+            lines.append(
+                f"  {snapshot.get('symbol', ''):<8} {safe_float(snapshot.get('last_price')):>8.3f} "
+                f"{safe_float(snapshot.get('position_value')):>7.0f} {pnl_text:>7} "
+                f"{snapshot.get('regime', 'n/a'):<8} {snapshot.get('trend_label', '?'):<6} {sentiment_text:<18} "
+                f"{snapshot.get('setup_label', 'idle'):<12} {snapshot.get('last_action', 'watch')}"
+            )
+            headlines = snapshot.get("top_headlines", [])
+            if headlines:
+                lines.append(f"    headlines: {headlines[0][:120]}")
+            reason = snapshot.get("reason")
+            if reason:
+                lines.append(f"    reason: {reason}")
 
     sys.stdout.write("\n".join(lines) + "\n")
     sys.stdout.flush()
@@ -558,6 +725,18 @@ def ema(seq: List[float], n: int) -> float:
     return value
 
 
+def ema_series(seq: List[float], n: int) -> List[float]:
+    if len(seq) < n:
+        return []
+    alpha = 2.0 / (n + 1.0)
+    value = seq[0]
+    values = [value]
+    for price in seq[1:]:
+        value = alpha * price + (1.0 - alpha) * value
+        values.append(value)
+    return values
+
+
 def rsi(seq: List[float], n: int) -> float:
     if len(seq) < n + 1:
         return float("nan")
@@ -622,6 +801,9 @@ def load_state(config: BotConfig) -> Dict[str, Any]:
             state.setdefault("equity", state.get("cash", config.initial_cash))
             state.setdefault("sym", {})
             state.setdefault("daily", {})
+            state.setdefault("weekly", {})
+            state.setdefault("meta", {"last_loop_at": None, "last_equity": state.get("equity", config.initial_cash), "consecutive_losses": 0})
+            state.setdefault("stats", {"closed": []})
             return state
         except Exception as exc:
             log_line(config, f"STATE_LOAD_ERROR: {type(exc).__name__}: {exc}")
@@ -652,6 +834,9 @@ def reset_trade_state(sym_state: Dict[str, Any]) -> None:
     sym_state["tp1_hit"] = False
     sym_state["high_water"] = None
     sym_state["last_entry_price"] = None
+    sym_state["live_stop"] = None
+    sym_state["entry_source"] = None
+    sym_state["entry_regime"] = None
 
 
 def can_fire(config: BotConfig, sym_state: Dict[str, Any]) -> bool:
@@ -684,6 +869,29 @@ def init_daily_controls(config: BotConfig, state: Dict[str, Any]) -> None:
         daily["halt"] = False
 
 
+def week_str() -> str:
+    year, week, _ = now_utc().isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def init_weekly_controls(config: BotConfig, state: Dict[str, Any]) -> None:
+    weekly = state.setdefault("weekly", {})
+    if weekly.get("week") != week_str():
+        weekly["week"] = week_str()
+        weekly["start_equity"] = state.get("equity", config.initial_cash)
+        weekly["halt"] = False
+
+
+def update_loss_streak(state: Dict[str, Any], new_equity: float) -> None:
+    meta = state.setdefault("meta", {})
+    last_equity = safe_float(meta.get("last_equity"), new_equity)
+    if new_equity < last_equity - 1e-9:
+        meta["consecutive_losses"] = int(meta.get("consecutive_losses", 0)) + 1
+    elif new_equity > last_equity + 1e-9:
+        meta["consecutive_losses"] = 0
+    meta["last_equity"] = new_equity
+
+
 def size_for_risk(config: BotConfig, cash: float, last: float, stop: float, equity: float, allocated_now: float) -> float:
     if not is_finite(last) or not is_finite(stop):
         return 0.0
@@ -702,6 +910,221 @@ def size_for_risk(config: BotConfig, cash: float, last: float, stop: float, equi
     max_qty_by_cash = cash / max(1e-9, last)
 
     return max(0.0, min(qty_risk_based, max_qty_by_coin_cap, max_qty_by_port, max_qty_by_cash))
+
+
+def trend_score(fast: float, slow: float, slope: float, last_close: float) -> float:
+    if not (is_finite(fast) and is_finite(slow) and is_finite(slope) and is_finite(last_close)):
+        return 0.0
+    score = 0.0
+    score += (fast - slow) / max(abs(slow), 1e-9)
+    score += slope / max(abs(last_close), 1e-9)
+    return score * 100.0
+
+
+def summarize_trend(score: float, trend_ok: bool) -> str:
+    if trend_ok and score >= 1.0:
+        return "strong"
+    if trend_ok:
+        return "up"
+    if score <= -1.0:
+        return "down"
+    return "mixed"
+
+
+def compute_position_value(position: Optional[BrokerPosition], last: float) -> float:
+    if position is None or position.qty <= 0:
+        return 0.0
+    return position.qty * last if is_finite(last) else position.market_value
+
+
+def compute_unrealized_pct(position: Optional[BrokerPosition], last: float) -> Optional[float]:
+    if position is None or position.qty <= 0 or not is_finite(position.avg_entry_price) or position.avg_entry_price <= 0:
+        return None
+    return ((last / position.avg_entry_price) - 1.0) * 100.0
+
+
+def sector_for_symbol(symbol: str) -> str:
+    return SECTOR_MAP.get(symbol, "other")
+
+
+def portfolio_heat(positions: Dict[str, BrokerPosition], state: Dict[str, Any], prices_now: Dict[str, float], equity: float) -> float:
+    if equity <= 0:
+        return 0.0
+    total_risk = 0.0
+    for symbol, position in positions.items():
+        if position.qty <= 0:
+            continue
+        last = prices_now.get(symbol, position.current_price)
+        entry = position.avg_entry_price
+        sym_state = state.get("sym", {}).get(symbol, {})
+        stored_stop = safe_float(sym_state.get("live_stop"), entry * 0.95)
+        risk_per_unit = max(0.0, entry - stored_stop)
+        total_risk += risk_per_unit * position.qty
+        if not is_finite(last):
+            total_risk += 0.0
+    return total_risk / equity
+
+
+def sector_exposure(positions: Dict[str, BrokerPosition], prices_now: Dict[str, float], equity: float) -> Dict[str, float]:
+    exposures: Dict[str, float] = {}
+    if equity <= 0:
+        return exposures
+    for symbol, position in positions.items():
+        if position.qty <= 0:
+            continue
+        last = prices_now.get(symbol, position.current_price)
+        notional = abs(position.qty * last) if is_finite(last) else abs(position.market_value)
+        sector = sector_for_symbol(symbol)
+        exposures[sector] = exposures.get(sector, 0.0) + (notional / equity)
+    return exposures
+
+
+def detect_regime(
+    trend_ok: bool,
+    trend_value: float,
+    atr_pct: float,
+    vol_ratio: float,
+    sentiment_snapshot: Optional[SentimentSnapshot],
+) -> RegimeSnapshot:
+    sentiment_score = 0.0 if sentiment_snapshot is None else sentiment_snapshot.score
+    acceleration = 0.0 if sentiment_snapshot is None else sentiment_snapshot.acceleration
+    if sentiment_score <= -0.55:
+        return RegimeSnapshot("panic", 0.35, False, False, False, 1.35)
+    if atr_pct >= 0.05 and sentiment_score >= 0.25:
+        return RegimeSnapshot("euphoria", 0.55, True, False, False, 1.25)
+    if trend_ok and trend_value >= 1.0 and atr_pct >= 0.01:
+        return RegimeSnapshot("trend", 1.00, True, True, True, 1.00)
+    if atr_pct < 0.007 and (not math.isfinite(vol_ratio) or vol_ratio < 1.0):
+        return RegimeSnapshot("chop", 0.0, False, False, False, 0.85)
+    if trend_ok and acceleration > 0.1:
+        return RegimeSnapshot("high-vol breakout", 0.85, True, False, True, 1.10)
+    if trend_ok:
+        return RegimeSnapshot("uptrend-lite", 0.80, True, True, False, 0.95)
+    return RegimeSnapshot("risk-off", 0.25, False, False, False, 1.15)
+
+
+def update_symbol_snapshot(
+    state: Dict[str, Any],
+    symbol: str,
+    *,
+    last: float,
+    position: Optional[BrokerPosition],
+    trend_ok: bool,
+    trend_value: float,
+    sentiment_snapshot: Optional[SentimentSnapshot],
+    entry_signal: Optional[EntrySignal],
+    last_action: str,
+    regime: Optional[RegimeSnapshot] = None,
+) -> None:
+    sym_state = get_sym_state(state, symbol)
+    sym_state["snapshot"] = {
+        "symbol": symbol,
+        "last_price": last,
+        "has_position": bool(position and position.qty > 0),
+        "position_value": compute_position_value(position, last),
+        "unrealized_pct": compute_unrealized_pct(position, last),
+        "trend_ok": trend_ok,
+        "trend_score": trend_value,
+        "trend_label": summarize_trend(trend_value, trend_ok),
+        "regime": None if regime is None else regime.name,
+        "sentiment_score": None if sentiment_snapshot is None else sentiment_snapshot.score,
+        "sentiment_label": "n/a" if sentiment_snapshot is None else sentiment_snapshot.label,
+        "sentiment_samples": 0 if sentiment_snapshot is None else sentiment_snapshot.sample_size,
+        "top_headlines": [] if sentiment_snapshot is None else sentiment_snapshot.top_headlines[:2],
+        "event_counts": {} if sentiment_snapshot is None else sentiment_snapshot.event_counts,
+        "entry_ready": entry_signal is not None,
+        "setup_label": "idle" if entry_signal is None else f"{entry_signal.source} {entry_signal.confidence:.2f}",
+        "reason": "" if entry_signal is None else entry_signal.reason,
+        "candidate_score": None,
+        "last_action": last_action,
+        "updated_at": now_utc().isoformat(),
+    }
+
+
+def set_snapshot_candidate_score(state: Dict[str, Any], symbol: str, candidate_score: Optional[float]) -> None:
+    snapshot = state.get("sym", {}).get(symbol, {}).get("snapshot")
+    if snapshot is not None:
+        snapshot["candidate_score"] = candidate_score
+
+
+def update_trade_stats(state: Dict[str, Any], symbol: str, source: str, regime: str, pnl_value: float, pnl_pct: float) -> None:
+    stats = state.setdefault("stats", {"closed": []})
+    record = {
+        "ts": now_utc().isoformat(),
+        "symbol": symbol,
+        "source": source,
+        "regime": regime,
+        "pnl_value": pnl_value,
+        "pnl_pct": pnl_pct,
+    }
+    closed = stats.setdefault("closed", [])
+    closed.append(record)
+    if len(closed) > 500:
+        del closed[:-500]
+
+
+def summarize_bucket(records: List[Dict[str, Any]]) -> Dict[str, float]:
+    count = len(records)
+    wins = [item for item in records if safe_float(item.get("pnl_value")) > 0]
+    losses = [item for item in records if safe_float(item.get("pnl_value")) < 0]
+    gross_wins = sum(safe_float(item.get("pnl_value")) for item in wins)
+    gross_losses = sum(safe_float(item.get("pnl_value")) for item in losses)
+    avg_pnl = sum(safe_float(item.get("pnl_value")) for item in records) / max(count, 1)
+    avg_win = gross_wins / max(len(wins), 1)
+    avg_loss = sum(safe_float(item.get("pnl_value")) for item in losses) / max(len(losses), 1)
+    expectancy = (len(wins) / max(count, 1)) * avg_win + (len(losses) / max(count, 1)) * avg_loss
+    return {
+        "count": count,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": len(wins) / max(count, 1),
+        "avg_pnl": avg_pnl,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "expectancy": expectancy,
+        "gross_wins": gross_wins,
+        "gross_losses": gross_losses,
+    }
+
+
+def build_research_report(state: Dict[str, Any]) -> Dict[str, Any]:
+    closed = state.get("stats", {}).get("closed", [])
+    summary = summarize_bucket(closed)
+    by_source_records: Dict[str, List[Dict[str, Any]]] = {}
+    by_regime_records: Dict[str, List[Dict[str, Any]]] = {}
+    by_symbol_records: Dict[str, List[Dict[str, Any]]] = {}
+    by_hour_records: Dict[str, List[Dict[str, Any]]] = {}
+    for item in closed:
+        by_source_records.setdefault(item.get("source", "unknown"), []).append(item)
+        by_regime_records.setdefault(item.get("regime", "unknown"), []).append(item)
+        by_symbol_records.setdefault(item.get("symbol", "unknown"), []).append(item)
+        hour_key = "unknown"
+        ts = item.get("ts")
+        try:
+            if ts:
+                hour_key = f"{datetime.fromisoformat(ts).hour:02d}"
+        except ValueError:
+            hour_key = "unknown"
+        by_hour_records.setdefault(hour_key, []).append(item)
+    by_source = {key: summarize_bucket(records) for key, records in by_source_records.items()}
+    by_regime = {key: summarize_bucket(records) for key, records in by_regime_records.items()}
+    by_symbol = {key: summarize_bucket(records) for key, records in by_symbol_records.items()}
+    by_hour = {key: summarize_bucket(records) for key, records in by_hour_records.items()}
+    return {
+        "generated_at": now_utc().isoformat(),
+        "closed_trades": summary["count"],
+        "win_rate": summary["win_rate"],
+        "avg_pnl": summary["avg_pnl"],
+        "expectancy": summary["expectancy"],
+        "gross_wins": summary["gross_wins"],
+        "gross_losses": summary["gross_losses"],
+        "by_source": by_source,
+        "by_regime": by_regime,
+        "by_symbol": by_symbol,
+        "by_hour": by_hour,
+        "loss_streak": int(state.get("meta", {}).get("consecutive_losses", 0)),
+        "reconciliation": state.get("meta", {}).get("reconciliation", {}),
+    }
 
 
 def compute_trend_ok(config: BotConfig, htf_closes: List[float]) -> Tuple[bool, float, float, float]:
@@ -744,8 +1167,12 @@ def build_entry_signal(
         return None
 
     rsi_value = rsi(closes, config.rsi_len)
-    fast_ema = ema(closes[-(config.ltf_fast_ema * 3) :], config.ltf_fast_ema)
-    slow_ema = ema(closes[-(config.ltf_slow_ema * 3) :], config.ltf_slow_ema)
+    fast_ema_values = ema_series(closes[-(config.ltf_fast_ema * 4) :], config.ltf_fast_ema)
+    slow_ema_values = ema_series(closes[-(config.ltf_slow_ema * 4) :], config.ltf_slow_ema)
+    if not fast_ema_values or not slow_ema_values:
+        return None
+    fast_ema = fast_ema_values[-1]
+    slow_ema = slow_ema_values[-1]
     atr_pct = atr_value / max(closes[-1], 1e-9)
     vol_ratio = volume_ratio(volumes, config.volume_window)
 
@@ -753,19 +1180,31 @@ def build_entry_signal(
     if not math.isfinite(breakout_raw):
         return None
     breakout_level = breakout_raw * (1.0 + config.breakout_buffer_bps / 10_000.0)
+    extension_atr = (closes[-1] - breakout_level) / max(atr_value, 1e-9)
+    slope_lookback = min(config.ema_slope_lookback, len(fast_ema_values) - 1)
+    fast_ema_slope = fast_ema - fast_ema_values[-1 - slope_lookback]
+    ema_spread_pct = (fast_ema - slow_ema) / max(closes[-1], 1e-9)
 
     momentum_ok = fast_ema > slow_ema and rsi_value >= config.rsi_entry_min
+    slope_ok = fast_ema_slope > 0
     volatility_ok = atr_pct >= config.min_atr_pct
     volume_ok = (not math.isfinite(vol_ratio)) or vol_ratio >= config.min_volume_ratio
     breakout_ok = closes[-2] < breakout_level <= closes[-1]
+    extension_ok = extension_atr <= config.max_breakout_atr_extension
+    rsi_ok = rsi_value <= config.max_entry_rsi
 
-    if not (momentum_ok and volatility_ok and volume_ok and breakout_ok):
+    if not (momentum_ok and slope_ok and volatility_ok and volume_ok and breakout_ok and extension_ok and rsi_ok):
         return None
 
     stop = breakout_level - config.stop_atr * atr_value
     tp1 = breakout_level + config.tp1_atr * atr_value
     tp2 = breakout_level + config.tp2_atr * atr_value
     trail_anchor = closes[-1] - config.trail_atr * atr_value
+    confidence = 1.0
+    confidence += min(0.20, max(0.0, ema_spread_pct * 100.0 * 0.25))
+    confidence += min(0.15, max(0.0, (vol_ratio - config.min_volume_ratio) * 0.25))
+    confidence += min(0.10, max(0.0, (config.max_entry_rsi - rsi_value) / max(config.max_entry_rsi, 1e-9)))
+    confidence = max(0.60, min(1.00, confidence))
     return EntrySignal(
         breakout_level=breakout_level,
         stop=stop,
@@ -776,6 +1215,10 @@ def build_entry_signal(
         volume_ratio=vol_ratio,
         rsi_value=rsi_value,
         source="technical",
+        confidence=confidence,
+        atr_pct=atr_pct,
+        ema_spread_pct=ema_spread_pct,
+        reason="breakout+momentum",
     )
 
 
@@ -799,6 +1242,8 @@ def build_sentiment_entry_signal(
     atr_pct = atr_value / max(last, 1e-9)
     if atr_pct < config.min_atr_pct:
         return None
+    if rsi_value > config.max_entry_rsi:
+        return None
 
     stop = last - config.stop_atr * atr_value
     tp1 = last + config.tp1_atr * atr_value
@@ -814,7 +1259,83 @@ def build_sentiment_entry_signal(
         volume_ratio=vol_ratio,
         rsi_value=rsi_value,
         source="sentiment",
+        confidence=0.85,
+        atr_pct=atr_pct,
+        ema_spread_pct=0.0,
+        reason="sentiment_momentum",
     )
+
+
+def build_pullback_entry_signal(
+    config: BotConfig,
+    closes: List[float],
+    highs: List[float],
+    lows: List[float],
+    volumes: List[float],
+) -> Optional[EntrySignal]:
+    if len(closes) < config.warmup_ltf:
+        return None
+    atr_value = atr(highs, lows, closes, config.atr_len)
+    if not math.isfinite(atr_value) or atr_value <= 0:
+        return None
+    fast_ema_values = ema_series(closes[-(config.ltf_fast_ema * 4) :], config.ltf_fast_ema)
+    slow_ema_values = ema_series(closes[-(config.ltf_slow_ema * 4) :], config.ltf_slow_ema)
+    if not fast_ema_values or not slow_ema_values:
+        return None
+    fast_ema = fast_ema_values[-1]
+    slow_ema = slow_ema_values[-1]
+    prev_fast = fast_ema_values[-2]
+    last = closes[-1]
+    prev_close = closes[-2]
+    rsi_value = rsi(closes, config.rsi_len)
+    atr_pct = atr_value / max(last, 1e-9)
+    vol_ratio = volume_ratio(volumes, config.volume_window)
+    pullback_distance = abs(prev_close - fast_ema) / max(atr_value, 1e-9)
+    reclaimed_fast = prev_close <= prev_fast and last > fast_ema
+    if not (
+        fast_ema > slow_ema
+        and last > slow_ema
+        and reclaimed_fast
+        and pullback_distance <= max(0.8, config.pullback_ema_buffer_atr + 0.4)
+        and rsi_value >= max(48.0, config.rsi_entry_min - 6.0)
+        and rsi_value <= config.max_entry_rsi
+        and atr_pct >= config.min_atr_pct
+    ):
+        return None
+    stop = min(lows[-3:]) - (0.5 * atr_value)
+    entry = last
+    confidence = 0.72
+    confidence += min(0.12, max(0.0, (1.4 - pullback_distance) * 0.08))
+    confidence += min(0.08, max(0.0, (vol_ratio - 1.0) * 0.10))
+    confidence = max(0.55, min(0.90, confidence))
+    return EntrySignal(
+        breakout_level=entry,
+        stop=stop,
+        tp1=entry + config.tp1_atr * atr_value,
+        tp2=entry + config.tp2_atr * atr_value,
+        trail_anchor=entry - config.trail_atr * atr_value,
+        atr_value=atr_value,
+        volume_ratio=vol_ratio,
+        rsi_value=rsi_value,
+        source="pullback",
+        confidence=confidence,
+        atr_pct=atr_pct,
+        ema_spread_pct=(fast_ema - slow_ema) / max(last, 1e-9),
+        reason="trend_pullback_reclaim",
+    )
+
+
+def score_setup(signal: EntrySignal, trend_value: float, sentiment_snapshot: Optional[SentimentSnapshot], regime: RegimeSnapshot) -> float:
+    sentiment_score = 0.0 if sentiment_snapshot is None else sentiment_snapshot.score
+    acceleration = 0.0 if sentiment_snapshot is None else sentiment_snapshot.acceleration
+    source_bonus = {"technical": 0.10, "pullback": 0.12, "sentiment": 0.08}.get(signal.source, 0.0)
+    return (
+        signal.confidence
+        + source_bonus
+        + min(0.25, max(0.0, trend_value / 10.0))
+        + min(0.20, max(0.0, sentiment_score * 0.5))
+        + min(0.10, max(0.0, acceleration * 0.4))
+    ) * regime.risk_multiplier
 
 
 def sentiment_allows_entry(config: BotConfig, snapshot: Optional[SentimentSnapshot]) -> bool:
@@ -841,6 +1362,195 @@ def sentiment_triggers_exit(config: BotConfig, snapshot: Optional[SentimentSnaps
         and snapshot is not None
         and snapshot.score <= config.sentiment_sell_threshold
     )
+
+
+def can_open_new_risk(config: BotConfig, state: Dict[str, Any]) -> bool:
+    if state.get("daily", {}).get("halt", False):
+        return False
+    if state.get("weekly", {}).get("halt", False):
+        return False
+    if int(state.get("meta", {}).get("consecutive_losses", 0)) >= config.max_consecutive_losses:
+        return False
+    return True
+
+
+def reconcile_positions_with_state(
+    config: BotConfig,
+    state: Dict[str, Any],
+    symbols: List[str],
+    positions: Dict[str, BrokerPosition],
+) -> Dict[str, int]:
+    reconciled = {"restored": 0, "cleared": 0, "mismatched_qty": 0}
+    for symbol in symbols:
+        sym_state = get_sym_state(state, symbol)
+        position = positions.get(symbol)
+        snapshot = sym_state.get("snapshot")
+        if position is None or position.qty <= 0:
+            had_live_state = any(
+                sym_state.get(key) is not None
+                for key in ("last_entry_price", "high_water", "live_stop", "entry_source", "entry_regime")
+            ) or bool(sym_state.get("tp1_hit", False))
+            if had_live_state:
+                reset_trade_state(sym_state)
+                reconciled["cleared"] += 1
+                if snapshot is not None:
+                    snapshot["last_action"] = "reconciled flat"
+                log_line(config, f"RECONCILE {symbol}: cleared stale position state because broker is flat.")
+            continue
+
+        last_entry_price = safe_float(sym_state.get("last_entry_price"))
+        if last_entry_price <= 0:
+            sym_state["last_entry_price"] = position.avg_entry_price
+            sym_state["high_water"] = max(
+                safe_float(sym_state.get("high_water"), position.current_price),
+                position.current_price,
+            )
+            sym_state["entry_source"] = sym_state.get("entry_source") or "broker_restore"
+            sym_state["entry_regime"] = sym_state.get("entry_regime") or "unknown"
+            reconciled["restored"] += 1
+            if snapshot is not None:
+                snapshot["last_action"] = "reconciled live"
+            log_line(config, f"RECONCILE {symbol}: restored missing entry state from broker position.")
+        elif abs(last_entry_price - position.avg_entry_price) / max(position.avg_entry_price, 1e-9) > 0.02:
+            sym_state["last_entry_price"] = position.avg_entry_price
+            reconciled["mismatched_qty"] += 1
+            if snapshot is not None:
+                snapshot["last_action"] = "reconciled avg"
+            log_line(config, f"RECONCILE {symbol}: updated entry price to broker average.")
+    state.setdefault("meta", {})["reconciliation"] = reconciled
+    return reconciled
+
+
+def execute_ranked_entries(
+    config: BotConfig,
+    broker: AlpacaPaperBroker,
+    state: Dict[str, Any],
+    account: AccountSnapshot,
+    positions: Dict[str, BrokerPosition],
+    prices_now: Dict[str, float],
+    candidates: List[CandidateSetup],
+    open_order_symbols: Set[str],
+) -> None:
+    if not candidates or not can_open_new_risk(config, state):
+        return
+
+    ranked = sorted(candidates, key=lambda item: item.score, reverse=True)
+    allocated = total_notional(positions, prices_now)
+    heat_now = portfolio_heat(positions, state, prices_now, account.equity)
+    sector_now = sector_exposure(positions, prices_now, account.equity)
+    entries_taken = 0
+
+    for candidate in ranked:
+        if entries_taken >= config.max_entries_per_loop:
+            break
+        symbol = candidate.symbol
+        if symbol in open_order_symbols:
+            continue
+        position = positions.get(symbol)
+        if position is not None and position.qty > 0:
+            continue
+        sym_state = get_sym_state(state, symbol)
+        if not can_fire(config, sym_state):
+            continue
+
+        buy_qty = size_for_risk(
+            config,
+            account.cash,
+            candidate.signal.breakout_level,
+            candidate.signal.stop,
+            account.equity,
+            allocated,
+        )
+        if buy_qty > 0:
+            buy_qty *= candidate.signal.confidence * candidate.regime.risk_multiplier
+        if buy_qty <= 0:
+            set_snapshot_candidate_score(state, symbol, candidate.score)
+            state["sym"][symbol]["snapshot"]["last_action"] = "size zero"
+            continue
+
+        proposed_notional = buy_qty * candidate.signal.breakout_level
+        proposed_risk = max(0.0, candidate.signal.breakout_level - candidate.signal.stop) * buy_qty
+        if heat_now + (proposed_risk / max(account.equity, 1e-9)) > config.max_portfolio_heat:
+            state["sym"][symbol]["snapshot"]["last_action"] = "heat cap"
+            write_signal_journal(
+                config,
+                symbol,
+                candidate.signal.source,
+                candidate.regime.name,
+                candidate.score,
+                None if candidate.sentiment is None else candidate.sentiment.score,
+                candidate.trend_score,
+                "rejected",
+                "portfolio_heat",
+            )
+            continue
+        if sector_now.get(candidate.sector, 0.0) + (proposed_notional / max(account.equity, 1e-9)) > config.max_sector_exposure:
+            state["sym"][symbol]["snapshot"]["last_action"] = "sector cap"
+            write_signal_journal(
+                config,
+                symbol,
+                candidate.signal.source,
+                candidate.regime.name,
+                candidate.score,
+                None if candidate.sentiment is None else candidate.sentiment.score,
+                candidate.trend_score,
+                "rejected",
+                "sector_exposure",
+            )
+            continue
+
+        order = broker.submit_market_buy(symbol, buy_qty)
+        sym_state["tp1_hit"] = False
+        sym_state["high_water"] = candidate.last_price
+        sym_state["last_entry_price"] = candidate.signal.breakout_level
+        sym_state["entry_source"] = candidate.signal.source
+        sym_state["entry_regime"] = candidate.regime.name
+        sym_state["live_stop"] = candidate.signal.stop
+        set_fired(sym_state)
+        entries_taken += 1
+        allocated += proposed_notional
+        heat_now += proposed_risk / max(account.equity, 1e-9)
+        sector_now[candidate.sector] = sector_now.get(candidate.sector, 0.0) + (proposed_notional / max(account.equity, 1e-9))
+        state.setdefault("meta", {})["entries_this_loop"] = entries_taken
+
+        note = (
+            f"order_id={order.id};source={candidate.signal.source};confidence={candidate.signal.confidence:.2f};"
+            f"score={candidate.score:.3f};rsi={candidate.signal.rsi_value:.2f};vol_ratio={candidate.signal.volume_ratio:.2f};"
+            f"atr={candidate.signal.atr_value:.6f};atr_pct={candidate.signal.atr_pct:.4f};"
+            f"ema_spread_pct={candidate.signal.ema_spread_pct:.4f};regime={candidate.regime.name};reason={candidate.signal.reason}"
+        )
+        if candidate.sentiment is not None:
+            note += f";sentiment={candidate.sentiment.score:.3f};sentiment_accel={candidate.sentiment.acceleration:.3f}"
+        write_trade(
+            config,
+            symbol,
+            "ENTRY_SUBMITTED",
+            candidate.last_price,
+            candidate.signal.breakout_level,
+            candidate.signal.stop,
+            candidate.signal.tp1,
+            candidate.signal.tp2,
+            buy_qty,
+            note,
+        )
+        write_signal_journal(
+            config,
+            symbol,
+            candidate.signal.source,
+            candidate.regime.name,
+            candidate.score,
+            None if candidate.sentiment is None else candidate.sentiment.score,
+            candidate.trend_score,
+            "accepted",
+            candidate.signal.reason,
+        )
+        snapshot = state.get("sym", {}).get(symbol, {}).get("snapshot")
+        if snapshot is not None:
+            snapshot["last_action"] = f"buy {candidate.signal.source}"
+            snapshot["candidate_score"] = candidate.score
+            snapshot["setup_label"] = f"{candidate.signal.source} {candidate.signal.confidence:.2f}"
+            snapshot["reason"] = candidate.signal.reason
+        log_line(config, f"{symbol} ENTRY submitted qty={buy_qty:.8f} source={candidate.signal.source} rank_score={candidate.score:.3f}")
 
 
 def compute_live_exit_levels(
@@ -877,6 +1587,15 @@ def update_daily_drawdown_halt(config: BotConfig, state: Dict[str, Any]) -> None
         state["daily"]["halt"] = True
 
 
+def update_weekly_drawdown_halt(config: BotConfig, state: Dict[str, Any]) -> None:
+    if config.weekly_dd_limit > 0.99:
+        return
+    start_equity = safe_float(state.get("weekly", {}).get("start_equity"), state["equity"])
+    current_drawdown = (start_equity - state["equity"]) / max(1e-9, start_equity)
+    if current_drawdown >= config.weekly_dd_limit:
+        state["weekly"]["halt"] = True
+
+
 def process_symbol(
     config: BotConfig,
     data_client: AlpacaCryptoDataClient,
@@ -889,22 +1608,23 @@ def process_symbol(
     positions: Dict[str, BrokerPosition],
     open_order_symbols: Set[str],
     prices_now: Dict[str, float],
-) -> None:
+) -> Optional[CandidateSetup]:
     sym_state = get_sym_state(state, symbol)
     position = positions.get(symbol)
+    action_label = "watch"
 
     htf_closes = data_client.fetch_htf_closes(symbol, max(config.warmup_htf, config.htf_slow + config.htf_slope_n + 5))
     if len(htf_closes) < max(config.htf_slow + config.htf_slope_n, config.warmup_htf):
         log_line(config, f"Not enough HTF bars for {symbol}")
         sym_state["warm_htf_ok"] = False
-        return
+        return None
     sym_state["warm_htf_ok"] = True
 
     highs, lows, closes, volumes = data_client.fetch_ltf_ohlcv(symbol, config.warmup_ltf + 5)
     if len(closes) < config.warmup_ltf:
         log_line(config, f"Not enough LTF bars for {symbol}")
         sym_state["warm_ltf_ok"] = False
-        return
+        return None
     sym_state["warm_ltf_ok"] = True
 
     last_tick = data_client.fetch_last_price(symbol)
@@ -912,12 +1632,18 @@ def process_symbol(
     prices_now[symbol] = last
 
     trend_ok, htf_fast, htf_slow, htf_slope = compute_trend_ok(config, htf_closes)
+    trend_value = trend_score(htf_fast, htf_slow, htf_slope, htf_closes[-1])
     log_line(
         config,
-        f"HTF {symbol}: fast={round(htf_fast, 2)}, slow={round(htf_slow, 2)}, slope={round(htf_slope, 4)}",
+        f"HTF {symbol}: fast={round(htf_fast, 2)}, slow={round(htf_slow, 2)}, slope={round(htf_slope, 4)}, score={round(trend_value, 2)}",
     )
 
-    entry_signal = build_entry_signal(config, closes, highs, lows, volumes)
+    atr_live = atr(highs, lows, closes, config.atr_len)
+    atr_pct_live = atr_live / max(closes[-1], 1e-9) if math.isfinite(atr_live) and atr_live > 0 else 0.0
+    vol_ratio_live = volume_ratio(volumes, config.volume_window)
+    breakout_signal = build_entry_signal(config, closes, highs, lows, volumes)
+    pullback_signal = build_pullback_entry_signal(config, closes, highs, lows, volumes)
+    entry_signal = breakout_signal
     sentiment_snapshot: Optional[SentimentSnapshot] = None
     if sentiment_client.is_active():
         try:
@@ -931,87 +1657,165 @@ def process_symbol(
                 log_line(
                     config,
                     f"{symbol} sentiment={sentiment_snapshot.score:.3f} "
-                    f"label={sentiment_snapshot.label} samples={sentiment_snapshot.sample_size} "
-                    f"sources={sentiment_snapshot.source_counts}",
+                    f"label={sentiment_snapshot.label} accel={sentiment_snapshot.acceleration:.3f} "
+                    f"samples={sentiment_snapshot.sample_size} sources={sentiment_snapshot.source_counts} "
+                    f"events={sentiment_snapshot.event_counts}",
                 )
+
+    regime = detect_regime(trend_ok, trend_value, atr_pct_live, vol_ratio_live, sentiment_snapshot)
 
     if position is None or position.qty <= 0:
         reset_trade_state(sym_state)
 
     if (now_utc() - started_at).total_seconds() < config.mute_secs:
+        action_label = "startup mute"
+        update_symbol_snapshot(
+            state,
+            symbol,
+            last=last,
+            position=position,
+            trend_ok=trend_ok,
+            trend_value=trend_value,
+            sentiment_snapshot=sentiment_snapshot,
+            entry_signal=entry_signal,
+            last_action=action_label,
+            regime=regime,
+        )
         log_line(config, f"{symbol} muted (startup)")
         sym_state["prev_price"] = last
-        return
+        return None
 
     update_daily_drawdown_halt(config, state)
     if symbol in open_order_symbols:
+        action_label = "open order"
+        update_symbol_snapshot(
+            state,
+            symbol,
+            last=last,
+            position=position,
+            trend_ok=trend_ok,
+            trend_value=trend_value,
+            sentiment_snapshot=sentiment_snapshot,
+            entry_signal=entry_signal,
+            last_action=action_label,
+            regime=regime,
+        )
         log_line(config, f"{symbol} has open orders; waiting.")
         sym_state["prev_price"] = last
-        return
+        return None
 
     if position is None or position.qty <= 0:
-        if state.get("daily", {}).get("halt", False):
-            log_line(config, "Daily DD limit reached; entries halted.")
+        setup_options: List[EntrySignal] = []
+        if breakout_signal and regime.allow_breakout:
+            setup_options.append(breakout_signal)
+        if pullback_signal and regime.allow_pullback:
+            setup_options.append(pullback_signal)
+
+        if not trend_ok and regime.allow_trend:
+            setup_options = [signal for signal in setup_options if signal.source == "sentiment"]
+
+        if not can_open_new_risk(config, state):
+            action_label = "halted"
+            log_line(config, "Risk halt reached; entries halted.")
         elif not trend_ok:
             if not sentiment_triggers_primary_entry(config, sentiment_snapshot):
+                action_label = "trend reject"
                 log_line(config, f"{symbol} HTF trend not OK; skip entry.")
+            else:
+                action_label = "sentiment override"
         else:
             if not sentiment_allows_entry(config, sentiment_snapshot):
+                action_label = "sentiment reject"
+                update_symbol_snapshot(
+                    state,
+                    symbol,
+                    last=last,
+                    position=position,
+                    trend_ok=trend_ok,
+                    trend_value=trend_value,
+                    sentiment_snapshot=sentiment_snapshot,
+                    entry_signal=entry_signal,
+                    last_action=action_label,
+                    regime=regime,
+                )
                 log_line(config, f"{symbol} sentiment did not confirm long entry.")
                 sym_state["prev_price"] = last
-                return
+                return None
 
-            if not entry_signal and sentiment_triggers_primary_entry(config, sentiment_snapshot):
-                entry_signal = build_sentiment_entry_signal(config, closes, highs, lows, volumes)
+            if sentiment_triggers_primary_entry(config, sentiment_snapshot):
+                momentum_signal = build_sentiment_entry_signal(config, closes, highs, lows, volumes)
+                if momentum_signal is not None:
+                    setup_options.append(momentum_signal)
+                action_label = "sentiment setup"
 
+        ranked_setups = sorted(
+            setup_options,
+            key=lambda signal: score_setup(signal, trend_value, sentiment_snapshot, regime),
+            reverse=True,
+        )
+        entry_signal = ranked_setups[0] if ranked_setups else None
+
+        candidate: Optional[CandidateSetup] = None
         if entry_signal and can_fire(config, sym_state) and (trend_ok or entry_signal.source == "sentiment"):
-            allocated = total_notional(positions, prices_now)
-            buy_qty = size_for_risk(
-                config,
-                account.cash,
-                entry_signal.breakout_level,
-                entry_signal.stop,
-                account.equity,
-                allocated,
+            candidate_score = score_setup(entry_signal, trend_value, sentiment_snapshot, regime)
+            candidate = CandidateSetup(
+                symbol=symbol,
+                signal=entry_signal,
+                regime=regime,
+                sentiment=sentiment_snapshot,
+                trend_score=trend_value,
+                sector=sector_for_symbol(symbol),
+                score=candidate_score,
+                last_price=last,
             )
-            if buy_qty > 0:
-                order = broker.submit_market_buy(symbol, buy_qty)
-                sym_state["tp1_hit"] = False
-                sym_state["high_water"] = last
-                sym_state["last_entry_price"] = entry_signal.breakout_level
-                set_fired(sym_state)
-                note = (
-                    f"order_id={order.id};source={entry_signal.source};rsi={entry_signal.rsi_value:.2f};"
-                    f"vol_ratio={entry_signal.volume_ratio:.2f};atr={entry_signal.atr_value:.6f}"
-                )
-                if sentiment_snapshot is not None:
-                    note += f";sentiment={sentiment_snapshot.score:.3f}"
-                write_trade(
-                    config,
-                    symbol,
-                    "ENTRY_SUBMITTED",
-                    last,
-                    entry_signal.breakout_level,
-                    entry_signal.stop,
-                    entry_signal.tp1,
-                    entry_signal.tp2,
-                    buy_qty,
-                    note,
-                )
-                log_line(config, f"{symbol} ENTRY submitted qty={buy_qty:.8f} source={entry_signal.source}")
+            set_snapshot_candidate_score(state, symbol, candidate_score)
+            action_label = f"candidate {entry_signal.source}"
+            write_signal_journal(
+                config,
+                symbol,
+                entry_signal.source,
+                regime.name,
+                candidate_score,
+                None if sentiment_snapshot is None else sentiment_snapshot.score,
+                trend_value,
+                "candidate",
+                entry_signal.reason,
+            )
         else:
-            log_line(config, f"{symbol} no valid breakout setup.")
+            if action_label == "watch":
+                action_label = "no setup"
+            log_line(config, f"{symbol} no valid setup. regime={regime.name}")
 
+        update_symbol_snapshot(
+            state,
+            symbol,
+            last=last,
+            position=position,
+            trend_ok=trend_ok,
+            trend_value=trend_value,
+            sentiment_snapshot=sentiment_snapshot,
+            entry_signal=entry_signal,
+            last_action=action_label,
+            regime=regime,
+        )
         sym_state["prev_price"] = last
-        return
+        return candidate
 
     stop, tp1, tp2 = compute_live_exit_levels(config, position, sym_state, closes, highs, lows)
+    sym_state["live_stop"] = stop
     qty = position.qty
     qty_available = position.qty_available
 
-    if sentiment_triggers_exit(config, sentiment_snapshot) and can_fire(config, sym_state) and qty_available > 0:
+    if (
+        sentiment_triggers_exit(config, sentiment_snapshot)
+        or (sentiment_snapshot is not None and sentiment_snapshot.score <= config.shock_sentiment_threshold)
+    ) and can_fire(config, sym_state) and qty_available > 0:
         order = broker.submit_market_sell(symbol, qty_available)
         set_fired(sym_state)
+        action_label = "sell sentiment"
+        pnl_value = (last - position.avg_entry_price) * qty_available
+        pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
+        update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct)
         write_trade(
             config,
             symbol,
@@ -1022,7 +1826,7 @@ def process_symbol(
             tp1,
             tp2,
             qty_available,
-            f"order_id={order.id};sentiment={sentiment_snapshot.score:.3f}",
+            f"order_id={order.id};sentiment={sentiment_snapshot.score:.3f};pnl_value={pnl_value:.4f};pnl_pct={pnl_pct:.3f}",
         )
         log_line(config, f"{symbol} bearish sentiment exit submitted qty={qty_available:.8f}")
 
@@ -1037,12 +1841,20 @@ def process_symbol(
             order = broker.submit_market_sell(symbol, sell_qty)
             sym_state["tp1_hit"] = True
             set_fired(sym_state)
-            write_trade(config, symbol, "TP1_SUBMITTED", last, position.avg_entry_price, stop, tp1, tp2, sell_qty, f"order_id={order.id}")
+            action_label = "take profit 1"
+            pnl_value = (last - position.avg_entry_price) * sell_qty
+            pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
+            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct)
+            write_trade(config, symbol, "TP1_SUBMITTED", last, position.avg_entry_price, stop, tp1, tp2, sell_qty, f"order_id={order.id};pnl_value={pnl_value:.4f};pnl_pct={pnl_pct:.3f}")
             log_line(config, f"{symbol} TP1 submitted qty={sell_qty:.8f}")
 
     elif crossed_up(sym_state.get("prev_price"), last, tp2) and can_fire(config, sym_state) and qty_available > 0:
         order = broker.submit_market_sell(symbol, qty_available)
         set_fired(sym_state)
+        action_label = "take profit 2"
+        pnl_value = (last - position.avg_entry_price) * qty_available
+        pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
+        update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct)
         write_trade(
             config,
             symbol,
@@ -1053,13 +1865,17 @@ def process_symbol(
             tp1,
             tp2,
             qty_available,
-            f"order_id={order.id}",
+            f"order_id={order.id};pnl_value={pnl_value:.4f};pnl_pct={pnl_pct:.3f}",
         )
         log_line(config, f"{symbol} TP2 exit submitted qty={qty_available:.8f}")
 
     elif crossed_down(sym_state.get("prev_price"), last, stop) and can_fire(config, sym_state) and qty_available > 0:
         order = broker.submit_market_sell(symbol, qty_available)
         set_fired(sym_state)
+        action_label = "stop exit"
+        pnl_value = (last - position.avg_entry_price) * qty_available
+        pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
+        update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct)
         write_trade(
             config,
             symbol,
@@ -1070,11 +1886,26 @@ def process_symbol(
             tp1,
             tp2,
             qty_available,
-            f"order_id={order.id}",
+            f"order_id={order.id};pnl_value={pnl_value:.4f};pnl_pct={pnl_pct:.3f}",
         )
         log_line(config, f"{symbol} stop exit submitted qty={qty_available:.8f}")
+    else:
+        action_label = "manage"
 
+    update_symbol_snapshot(
+        state,
+        symbol,
+        last=last,
+        position=position,
+        trend_ok=trend_ok,
+        trend_value=trend_value,
+        sentiment_snapshot=sentiment_snapshot,
+        entry_signal=entry_signal,
+        last_action=action_label,
+        regime=regime,
+    )
     sym_state["prev_price"] = last
+    return None
 
 
 def run_once(
@@ -1089,15 +1920,26 @@ def run_once(
     account = broker.get_account_snapshot()
     state["cash"] = account.cash
     state["equity"] = account.equity
+    meta = state.setdefault("meta", {})
+    meta["last_loop_at"] = now_utc().isoformat()
+    meta["entries_this_loop"] = 0
     init_daily_controls(config, state)
+    init_weekly_controls(config, state)
+    update_loss_streak(state, account.equity)
+    update_daily_drawdown_halt(config, state)
+    update_weekly_drawdown_halt(config, state)
 
     positions = broker.get_positions(symbols)
     open_order_symbols = broker.get_open_order_symbols(symbols)
+    reconcile_positions_with_state(config, state, symbols, positions)
     prices_now: Dict[str, float] = {}
+    candidates: List[CandidateSetup] = []
+    meta["portfolio_heat"] = portfolio_heat(positions, state, prices_now, account.equity)
+    meta["sector_exposure"] = sector_exposure(positions, prices_now, account.equity)
 
     for symbol in symbols:
         try:
-            process_symbol(
+            candidate = process_symbol(
                 config=config,
                 data_client=data_client,
                 broker=broker,
@@ -1110,12 +1952,31 @@ def run_once(
                 open_order_symbols=open_order_symbols,
                 prices_now=prices_now,
             )
+            if candidate is not None:
+                candidates.append(candidate)
         except Exception as exc:
             log_line(config, f"{symbol} ERROR: {type(exc).__name__}: {exc}")
 
+    meta["candidate_count"] = len(candidates)
+    meta["top_candidates"] = [
+        {
+            "symbol": candidate.symbol,
+            "score": round(candidate.score, 4),
+            "setup": candidate.signal.source,
+            "regime": candidate.regime.name,
+        }
+        for candidate in sorted(candidates, key=lambda item: item.score, reverse=True)[:5]
+    ]
+    execute_ranked_entries(config, broker, state, account, positions, prices_now, candidates, open_order_symbols)
+
     account = broker.get_account_snapshot()
+    positions = broker.get_positions(symbols)
+    open_order_symbols = broker.get_open_order_symbols(symbols)
     state["cash"] = account.cash
     state["equity"] = account.equity
+    meta["portfolio_heat"] = portfolio_heat(positions, state, prices_now, max(account.equity, 1e-9))
+    meta["sector_exposure"] = sector_exposure(positions, prices_now, max(account.equity, 1e-9))
+    config.research_report.write_text(json.dumps(build_research_report(state), indent=2), encoding="utf-8")
     print_dashboard(config, state, positions, open_order_symbols)
     save_state(config, state)
     log_line(config, f"Heartbeat: equity=${state['equity']:.2f}, cash=${state['cash']:.2f}")
@@ -1146,7 +2007,9 @@ def main() -> None:
 
     symbols = [symbol for symbol in config.symbols if data_client.probe_symbol(symbol)]
     ensure_trades_csv(config)
+    ensure_signals_csv(config)
     init_daily_controls(config, state)
+    init_weekly_controls(config, state)
     log_line(config, f"Active universe: {symbols}")
 
     while True:
