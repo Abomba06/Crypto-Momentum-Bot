@@ -1867,6 +1867,18 @@ def summarize_feature(records: List[Dict[str, Any]], field: str) -> Dict[str, Di
     return {key: summarize_bucket(items) for key, items in buckets.items()}
 
 
+def probability_bucket(value: float) -> str:
+    if value >= 0.8:
+        return "0.80+"
+    if value >= 0.65:
+        return "0.65-0.79"
+    if value >= 0.5:
+        return "0.50-0.64"
+    if value > 0:
+        return "0.01-0.49"
+    return "0.00"
+
+
 def _read_csv_rows(path: pathlib.Path) -> List[Dict[str, str]]:
     if not path.exists():
         return []
@@ -1927,6 +1939,16 @@ def apply_live_source_tuning(state: Dict[str, Any], report: Dict[str, Any], arti
         int(event_prediction.get("resolved_count", 0)) >= 5
         and safe_float(event_prediction.get("hit_rate")) < 0.45
     )
+    calibration_error = safe_float(event_prediction.get("calibration_error"))
+    prediction_weight = 1.0
+    if int(event_prediction.get("resolved_count", 0)) >= 5:
+        if meta["event_prediction_degraded"]:
+            prediction_weight = 0.30
+        elif calibration_error > 0.18:
+            prediction_weight = 0.55
+        elif calibration_error > 0.10:
+            prediction_weight = 0.78
+    meta["event_prediction_weight"] = prediction_weight
 
 
 def build_parameter_health(
@@ -2021,6 +2043,8 @@ def build_runtime_alerts(config: BotConfig, state: Dict[str, Any], report: Dict[
         alerts.append("Research health is on watch.")
     if bool(meta.get("event_prediction_degraded")):
         alerts.append("Event prediction quality is degraded.")
+    elif safe_float(meta.get("event_prediction_weight"), 1.0) < 0.99:
+        alerts.append(f"Event prediction weight reduced to x{safe_float(meta.get('event_prediction_weight'), 1.0):.2f}.")
     return alerts[:6]
 
 
@@ -2143,12 +2167,34 @@ def build_research_report(state: Dict[str, Any]) -> Dict[str, Any]:
     health = build_parameter_health(summary, by_source, by_regime)
     resolved_predictions = [item for item in closed if item.get("event_prediction_hit") is not None]
     prediction_hits = [item for item in resolved_predictions if bool(item.get("event_prediction_hit"))]
+    confidence_buckets: Dict[str, Dict[str, float]] = {}
+    calibration_error = 0.0
+    if resolved_predictions:
+        bucket_records: Dict[str, List[Dict[str, Any]]] = {}
+        brier_total = 0.0
+        for item in resolved_predictions:
+            probability = safe_float(item.get("predicted_event_probability"))
+            outcome = 1.0 if bool(item.get("event_prediction_hit")) else 0.0
+            brier_total += (probability - outcome) ** 2
+            bucket_records.setdefault(probability_bucket(probability), []).append(item)
+        calibration_error = brier_total / max(len(resolved_predictions), 1)
+        for bucket, records in bucket_records.items():
+            avg_probability = sum(safe_float(item.get("predicted_event_probability")) for item in records) / max(len(records), 1)
+            hit_rate = sum(1 for item in records if bool(item.get("event_prediction_hit"))) / max(len(records), 1)
+            confidence_buckets[bucket] = {
+                "count": len(records),
+                "avg_probability": avg_probability,
+                "hit_rate": hit_rate,
+                "gap": abs(avg_probability - hit_rate),
+            }
     event_prediction = {
         "resolved_count": len(resolved_predictions),
         "hit_rate": len(prediction_hits) / max(len(resolved_predictions), 1),
         "avg_predicted_probability": (
             sum(safe_float(item.get("predicted_event_probability")) for item in resolved_predictions) / max(len(resolved_predictions), 1)
         ),
+        "calibration_error": calibration_error,
+        "confidence_buckets": confidence_buckets,
         "by_predicted_event": summarize_feature(
             [item for item in resolved_predictions if item.get("predicted_event_type") not in {None, "none"}],
             "predicted_event_type",
@@ -3171,7 +3217,7 @@ def process_symbol(
     symbol_liquidity_tier = liquidity_tier(symbol)
     symbol_cross_asset_factor = cross_asset_multiplier(symbol, cross_asset) * cross_asset.risk_multiplier
     symbol_rotation_factor = rotation_multiplier_for_symbol(config, symbol, sector_rotation_scores, theme_rotation_scores)
-    prediction_weight = 0.35 if state.get("meta", {}).get("event_prediction_degraded", False) else 1.0
+    prediction_weight = safe_float(state.get("meta", {}).get("event_prediction_weight"), 1.0)
     breakout_signal = build_entry_signal(config, closes, highs, lows, volumes)
     pullback_signal = build_pullback_entry_signal(config, closes, highs, lows, volumes)
     compression_signal = build_compression_breakout_signal(config, closes, highs, lows, volumes)

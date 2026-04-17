@@ -789,6 +789,8 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertIn("store-of-value", report["by_feature"]["theme"])
         self.assertIn("event_prediction", report)
         self.assertEqual(report["event_prediction"]["resolved_count"], 2)
+        self.assertIn("calibration_error", report["event_prediction"])
+        self.assertIn("confidence_buckets", report["event_prediction"])
 
     def test_build_research_report_flags_degraded_health_when_expectancy_is_negative(self):
         state = crypto_trader.default_state(100000.0)
@@ -829,6 +831,15 @@ class StrategySmokeTests(unittest.TestCase):
         crypto_trader.apply_live_source_tuning(state, report, artifacts)
         self.assertIn("technical", state["meta"]["disabled_sources"])
         self.assertTrue(state["meta"]["event_prediction_degraded"])
+        self.assertLess(state["meta"]["event_prediction_weight"], 1.0)
+
+    def test_apply_live_source_tuning_reduces_prediction_weight_on_calibration_error(self):
+        state = crypto_trader.default_state(100000.0)
+        report = {"by_source": {}, "event_prediction": {"resolved_count": 8, "hit_rate": 0.62, "calibration_error": 0.14}}
+        artifacts = {"accepted_by_setup": {}}
+        crypto_trader.apply_live_source_tuning(state, report, artifacts)
+        self.assertLess(state["meta"]["event_prediction_weight"], 1.0)
+        self.assertFalse(state["meta"]["event_prediction_degraded"])
 
     def test_trade_metadata_with_realized_event_marks_prediction_hit(self):
         sym_state = {
