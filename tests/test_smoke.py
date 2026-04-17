@@ -45,6 +45,8 @@ def make_config(case_name: str) -> crypto_trader.BotConfig:
         bollinger_std=2.0,
         mean_reversion_rsi_max=46.0,
         mean_reversion_band_buffer=0.15,
+        divergence_lookback=18,
+        divergence_rsi_max=48.0,
         warmup_ltf=70,
         warmup_htf=220,
         mute_secs=90,
@@ -453,6 +455,16 @@ class StrategySmokeTests(unittest.TestCase):
         signal = crypto_trader.build_failed_breakdown_signal(config, closes, highs, lows, volumes)
         self.assertIsNotNone(signal)
         self.assertEqual(signal.source, "reversal")
+
+    def test_bullish_divergence_signal_can_trigger(self):
+        config = make_config("divergence")
+        closes = [100 + i * 0.06 for i in range(55)] + [103, 101, 98, 95.8, 97.4, 99.2, 100.1, 99.8, 99.4, 99.0, 98.7, 98.3, 97.9, 97.5, 97.1, 96.7, 96.3, 95.4, 96.9]
+        highs = [c + 0.7 for c in closes]
+        lows = [c - 0.7 for c in closes]
+        volumes = [1000.0 + (i % 5) * 20 for i in range(len(closes))]
+        signal = crypto_trader.build_bullish_divergence_signal(config, closes, highs, lows, volumes)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.source, "divergence")
 
     def test_build_news_momentum_signal_requires_fresh_bullish_catalyst(self):
         config = make_config("news_momentum")

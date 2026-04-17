@@ -134,6 +134,8 @@ class BotConfig:
     bollinger_std: float
     mean_reversion_rsi_max: float
     mean_reversion_band_buffer: float
+    divergence_lookback: int
+    divergence_rsi_max: float
     warmup_ltf: int
     warmup_htf: int
     mute_secs: int
@@ -300,6 +302,8 @@ class BotConfig:
             bollinger_std=float(os.getenv("BOLLINGER_STD", "2.0")),
             mean_reversion_rsi_max=float(os.getenv("MEAN_REVERSION_RSI_MAX", "46")),
             mean_reversion_band_buffer=float(os.getenv("MEAN_REVERSION_BAND_BUFFER", "0.15")),
+            divergence_lookback=int(os.getenv("DIVERGENCE_LOOKBACK", "18")),
+            divergence_rsi_max=float(os.getenv("DIVERGENCE_RSI_MAX", "48")),
             warmup_ltf=warmup_ltf,
             warmup_htf=warmup_htf,
             mute_secs=int(os.getenv("MUTE_SECS", "90")),
@@ -2485,6 +2489,70 @@ def build_mean_reversion_signal(
     return None
 
 
+def build_bullish_divergence_signal(
+    config: BotConfig,
+    closes: List[float],
+    highs: List[float],
+    lows: List[float],
+    volumes: List[float],
+) -> Optional[EntrySignal]:
+    if len(closes) < max(config.warmup_ltf, config.divergence_lookback + config.rsi_len + 5):
+        return None
+    atr_value = atr(highs, lows, closes, config.atr_len)
+    if not math.isfinite(atr_value) or atr_value <= 0:
+        return None
+    lookback = config.divergence_lookback
+    recent_prices = closes[-lookback:]
+    recent_rsi_series = [rsi(closes[: idx + 1], config.rsi_len) for idx in range(len(closes) - lookback, len(closes))]
+    if len(recent_rsi_series) < lookback:
+        return None
+    first_half = recent_prices[: lookback // 2]
+    second_half = recent_prices[lookback // 2 :]
+    first_half_rsi = recent_rsi_series[: lookback // 2]
+    second_half_rsi = recent_rsi_series[lookback // 2 :]
+    first_low_idx = min(range(len(first_half)), key=lambda idx: first_half[idx])
+    second_low_idx = min(range(len(second_half)), key=lambda idx: second_half[idx])
+    first_price_low = first_half[first_low_idx]
+    second_price_low = second_half[second_low_idx]
+    first_rsi_low = first_half_rsi[first_low_idx]
+    second_rsi_low = second_half_rsi[second_low_idx]
+    last = closes[-1]
+    last_rsi = recent_rsi_series[-1]
+    vol_ratio = volume_ratio(volumes, config.volume_window)
+    atr_pct = atr_value / max(last, 1e-9)
+    if atr_pct < config.min_atr_pct * 0.85:
+        return None
+    if not (math.isfinite(first_rsi_low) and math.isfinite(second_rsi_low) and math.isfinite(last_rsi)):
+        return None
+    price_makes_lower_low = second_price_low < first_price_low * 0.997
+    rsi_makes_higher_low = second_rsi_low > first_rsi_low + 3.0
+    recovery_ok = last > second_price_low + (0.35 * atr_value)
+    oversold_ok = min(second_rsi_low, last_rsi) <= config.divergence_rsi_max
+    if not (price_makes_lower_low and rsi_makes_higher_low and recovery_ok and oversold_ok):
+        return None
+    confidence = 0.64
+    confidence += min(0.10, max(0.0, (second_rsi_low - first_rsi_low) / 20.0))
+    confidence += min(0.08, max(0.0, (last - second_price_low) / max(atr_value, 1e-9) * 0.06))
+    stop = min(lows[-lookback:]) - (0.6 * atr_value)
+    tp1 = last + config.tp1_atr * atr_value
+    tp2 = last + min(config.tp2_atr, 2.4) * atr_value
+    return EntrySignal(
+        breakout_level=last,
+        stop=stop,
+        tp1=tp1,
+        tp2=tp2,
+        trail_anchor=last - config.trail_atr * atr_value,
+        atr_value=atr_value,
+        volume_ratio=vol_ratio,
+        rsi_value=last_rsi,
+        source="divergence",
+        confidence=max(0.58, min(0.86, confidence)),
+        atr_pct=atr_pct,
+        ema_spread_pct=0.0,
+        reason="bullish_rsi_divergence",
+    )
+
+
 def build_news_momentum_signal(
     config: BotConfig,
     closes: List[float],
@@ -2745,6 +2813,7 @@ def score_setup(
         "compression": 0.14,
         "reversal": 0.10,
         "mean_reversion": 0.13,
+        "divergence": 0.12,
         "news_momentum": 0.16,
     }.get(signal.source, 0.0)
     base = (
@@ -2761,6 +2830,8 @@ def score_setup(
         base -= min(0.10, predicted_event_probability * 0.12) * prediction_weight
     if signal.source == "mean_reversion" and any(tag in regime.name for tag in ("chop", "range")):
         base += 0.08
+    if signal.source == "divergence" and any(tag in regime.name for tag in ("chop", "range", "uptrend-lite")):
+        base += 0.06
     return base * regime.risk_multiplier * execution_quality * cross_asset_factor * rotation_multiplier
 
 
@@ -3223,6 +3294,7 @@ def process_symbol(
     compression_signal = build_compression_breakout_signal(config, closes, highs, lows, volumes)
     reversal_signal = build_failed_breakdown_signal(config, closes, highs, lows, volumes)
     mean_reversion_signal = build_mean_reversion_signal(config, closes, highs, lows, volumes)
+    divergence_signal = build_bullish_divergence_signal(config, closes, highs, lows, volumes)
     entry_signal = breakout_signal
     sentiment_snapshot: Optional[SentimentSnapshot] = None
     if sentiment_client.is_active():
@@ -3305,6 +3377,8 @@ def process_symbol(
             setup_options.append(reversal_signal)
         if mean_reversion_signal and any(tag in regime.name for tag in ("chop", "range")):
             setup_options.append(mean_reversion_signal)
+        if divergence_signal and any(tag in regime.name for tag in ("chop", "range", "uptrend-lite")):
+            setup_options.append(divergence_signal)
         news_momentum_signal = build_news_momentum_signal(config, closes, highs, lows, volumes, sentiment_snapshot)
         if news_momentum_signal and (trend_ok or sentiment_triggers_primary_entry(config, sentiment_snapshot)):
             setup_options.append(news_momentum_signal)
