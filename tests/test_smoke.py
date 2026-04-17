@@ -47,6 +47,9 @@ def make_config(case_name: str) -> crypto_trader.BotConfig:
         mean_reversion_band_buffer=0.15,
         divergence_lookback=18,
         divergence_rsi_max=48.0,
+        vol_of_vol_window=24,
+        vol_of_vol_threshold=1.35,
+        vol_of_vol_cooloff=0.78,
         warmup_ltf=70,
         warmup_htf=220,
         mute_secs=90,
@@ -465,6 +468,17 @@ class StrategySmokeTests(unittest.TestCase):
         signal = crypto_trader.build_bullish_divergence_signal(config, closes, highs, lows, volumes)
         self.assertIsNotNone(signal)
         self.assertEqual(signal.source, "divergence")
+
+    def test_volatility_reentry_signal_can_trigger_after_shock_cooloff(self):
+        config = make_config("vol_reentry")
+        config = crypto_trader.BotConfig(**{**config.__dict__, "vol_of_vol_threshold": 1.0, "vol_of_vol_cooloff": 0.95})
+        closes = [100 + i * 0.04 for i in range(60)] + [104, 97, 105, 98, 104, 99, 103, 100, 102.5, 100.8, 102.0, 101.2, 102.4, 101.8, 102.7]
+        highs = [c + (2.8 if idx in {50, 51, 52, 53, 54, 55} else 0.9) for idx, c in enumerate(closes)]
+        lows = [c - (2.8 if idx in {50, 51, 52, 53, 54, 55} else 0.9) for idx, c in enumerate(closes)]
+        volumes = [1000.0 + (80 if idx in {50, 51, 52, 53, 54, 55} else (idx % 5) * 20) for idx in range(len(closes))]
+        signal = crypto_trader.build_volatility_reentry_signal(config, closes, highs, lows, volumes)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.source, "vol_reentry")
 
     def test_build_news_momentum_signal_requires_fresh_bullish_catalyst(self):
         config = make_config("news_momentum")

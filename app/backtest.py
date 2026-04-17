@@ -48,6 +48,9 @@ class BacktestConfig:
     mean_reversion_band_buffer: float = 0.15
     divergence_lookback: int = 18
     divergence_rsi_max: float = 48.0
+    vol_of_vol_window: int = 24
+    vol_of_vol_threshold: float = 1.35
+    vol_of_vol_cooloff: float = 0.78
     max_breakout_atr_extension: float = 0.8
     max_entry_rsi: float = 72.0
     ema_slope_lookback: int = 3
@@ -165,6 +168,9 @@ def as_runtime_config(config: BacktestConfig) -> Any:
         mean_reversion_band_buffer=config.mean_reversion_band_buffer,
         divergence_lookback=config.divergence_lookback,
         divergence_rsi_max=config.divergence_rsi_max,
+        vol_of_vol_window=config.vol_of_vol_window,
+        vol_of_vol_threshold=config.vol_of_vol_threshold,
+        vol_of_vol_cooloff=config.vol_of_vol_cooloff,
         sentiment_enabled=bool(config.event_stream),
         sentiment_mode="confirm",
         sentiment_buy_threshold=0.15,
@@ -411,6 +417,7 @@ def simulate_strategy(df: pd.DataFrame, config: Optional[BacktestConfig] = None)
             reversal_signal = crypto_trader.build_failed_breakdown_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             mean_reversion_signal = crypto_trader.build_mean_reversion_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             divergence_signal = crypto_trader.build_bullish_divergence_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
+            vol_reentry_signal = crypto_trader.build_volatility_reentry_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             event_signal = crypto_trader.build_news_momentum_signal(runtime, window_closes, window_highs, window_lows, window_volumes, event_snapshot)
             if breakout_signal and regime.allow_breakout:
                 setup_options.append(breakout_signal)
@@ -424,6 +431,8 @@ def simulate_strategy(df: pd.DataFrame, config: Optional[BacktestConfig] = None)
                 setup_options.append(mean_reversion_signal)
             if divergence_signal and any(tag in regime.name for tag in ("chop", "range", "uptrend-lite")):
                 setup_options.append(divergence_signal)
+            if vol_reentry_signal and any(tag in regime.name for tag in ("trend", "uptrend-lite", "high-vol breakout")):
+                setup_options.append(vol_reentry_signal)
             if event_signal is not None:
                 setup_options.append(event_signal)
             if not micro.allow_entry:
@@ -676,6 +685,7 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
             reversal_signal = crypto_trader.build_failed_breakdown_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             mean_reversion_signal = crypto_trader.build_mean_reversion_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             divergence_signal = crypto_trader.build_bullish_divergence_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
+            vol_reentry_signal = crypto_trader.build_volatility_reentry_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             event_signal = crypto_trader.build_news_momentum_signal(runtime, window_closes, window_highs, window_lows, window_volumes, event_snapshot)
             if breakout_signal and regime.allow_breakout:
                 setup_options.append(breakout_signal)
@@ -689,6 +699,8 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                 setup_options.append(mean_reversion_signal)
             if divergence_signal and any(tag in regime.name for tag in ("chop", "range", "uptrend-lite")):
                 setup_options.append(divergence_signal)
+            if vol_reentry_signal and any(tag in regime.name for tag in ("trend", "uptrend-lite", "high-vol breakout")):
+                setup_options.append(vol_reentry_signal)
             if event_signal is not None:
                 setup_options.append(event_signal)
             if not micro.allow_entry:
