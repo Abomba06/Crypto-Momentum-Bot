@@ -550,7 +550,7 @@ def ensure_signals_csv(config: BotConfig) -> None:
 
 
 def ensure_twitter_events_csv(config: BotConfig) -> None:
-    header = ["ts", "symbol", "author", "event_type", "score", "confirmation_state", "action", "reason", "text"]
+    header = ["ts", "symbol", "author", "event_type", "predicted_event_type", "predicted_probability", "score", "confirmation_state", "action", "reason", "text"]
     is_new = not config.twitter_events_csv.exists()
     with config.twitter_events_csv.open("a", newline="", encoding="utf-8") as file_obj:
         writer = csv.writer(file_obj)
@@ -634,6 +634,8 @@ def write_twitter_event_journal(
                 symbol,
                 "" if top_item is None else top_item.author_display_name or top_item.author_username,
                 snapshot.dominant_event_type,
+                snapshot.predicted_event_type,
+                f"{safe_float(snapshot.predicted_event_probability):.4f}",
                 f"{safe_float(snapshot.primary_twitter_score):.4f}",
                 snapshot.confirmation_state,
                 action,
@@ -1920,6 +1922,11 @@ def apply_live_source_tuning(state: Dict[str, Any], report: Dict[str, Any], arti
             if safe_float(source_health.get(source, {}).get("expectancy")) < 0:
                 disabled_sources.add(source)
     meta["disabled_sources"] = sorted(disabled_sources)
+    event_prediction = report.get("event_prediction", {})
+    meta["event_prediction_degraded"] = (
+        int(event_prediction.get("resolved_count", 0)) >= 5
+        and safe_float(event_prediction.get("hit_rate")) < 0.45
+    )
 
 
 def build_parameter_health(
@@ -2012,6 +2019,8 @@ def build_runtime_alerts(config: BotConfig, state: Dict[str, Any], report: Dict[
         alerts.append("Research expectancy is degraded.")
     elif health.get("status") == "watch":
         alerts.append("Research health is on watch.")
+    if bool(meta.get("event_prediction_degraded")):
+        alerts.append("Event prediction quality is degraded.")
     return alerts[:6]
 
 
@@ -2062,7 +2071,35 @@ def trade_metadata_from_state(sym_state: Dict[str, Any]) -> Dict[str, Any]:
         "liquidity_tier": sym_state.get("entry_liquidity_tier", "unknown"),
         "relative_strength_bucket": rs_bucket(rel_strength),
         "execution_quality_bucket": execution_bucket(execution_quality),
+        "predicted_event_type": sym_state.get("entry_predicted_event_type", "none"),
+        "predicted_event_probability": safe_float(sym_state.get("entry_predicted_event_probability")),
+        "entry_event_type": sym_state.get("entry_event_type", "none"),
     }
+
+
+def event_prediction_hit(predicted_event_type: str, realized_event_type: str) -> Optional[bool]:
+    predicted = str(predicted_event_type or "none")
+    realized = str(realized_event_type or "none")
+    if predicted == "none" or realized == "none":
+        return None
+    if predicted == realized:
+        return True
+    paired = {predicted, realized}
+    if paired == {"approval", "etf"}:
+        return True
+    return False
+
+
+def trade_metadata_with_realized_event(
+    sym_state: Dict[str, Any],
+    snapshot: Optional[SentimentSnapshot],
+) -> Dict[str, Any]:
+    metadata = trade_metadata_from_state(sym_state)
+    realized_event_type = "none" if snapshot is None else snapshot.dominant_event_type
+    metadata["realized_event_type"] = realized_event_type
+    hit = event_prediction_hit(metadata.get("predicted_event_type", "none"), realized_event_type)
+    metadata["event_prediction_hit"] = hit
+    return metadata
 
 
 def update_strategy_health_halt(config: BotConfig, state: Dict[str, Any], report: Dict[str, Any]) -> None:
@@ -2104,6 +2141,19 @@ def build_research_report(state: Dict[str, Any]) -> Dict[str, Any]:
     by_symbol = {key: summarize_bucket(records) for key, records in by_symbol_records.items()}
     by_hour = {key: summarize_bucket(records) for key, records in by_hour_records.items()}
     health = build_parameter_health(summary, by_source, by_regime)
+    resolved_predictions = [item for item in closed if item.get("event_prediction_hit") is not None]
+    prediction_hits = [item for item in resolved_predictions if bool(item.get("event_prediction_hit"))]
+    event_prediction = {
+        "resolved_count": len(resolved_predictions),
+        "hit_rate": len(prediction_hits) / max(len(resolved_predictions), 1),
+        "avg_predicted_probability": (
+            sum(safe_float(item.get("predicted_event_probability")) for item in resolved_predictions) / max(len(resolved_predictions), 1)
+        ),
+        "by_predicted_event": summarize_feature(
+            [item for item in resolved_predictions if item.get("predicted_event_type") not in {None, "none"}],
+            "predicted_event_type",
+        ),
+    }
     by_feature = {
         "theme": summarize_feature(closed, "theme"),
         "liquidity_tier": summarize_feature(closed, "liquidity_tier"),
@@ -2124,6 +2174,7 @@ def build_research_report(state: Dict[str, Any]) -> Dict[str, Any]:
         "by_symbol": by_symbol,
         "by_hour": by_hour,
         "by_feature": by_feature,
+        "event_prediction": event_prediction,
         "health": health,
         "loss_streak": int(state.get("meta", {}).get("consecutive_losses", 0)),
         "reconciliation": state.get("meta", {}).get("reconciliation", {}),
@@ -2633,6 +2684,7 @@ def score_setup(
     execution_quality: float = 1.0,
     cross_asset_factor: float = 1.0,
     rotation_multiplier: float = 1.0,
+    prediction_weight: float = 1.0,
 ) -> float:
     sentiment_score = 0.0 if sentiment_snapshot is None else sentiment_snapshot.score
     acceleration = 0.0 if sentiment_snapshot is None else sentiment_snapshot.acceleration
@@ -2658,9 +2710,9 @@ def score_setup(
         + min(0.18, max(-0.12, relative_strength * 1.8))
     )
     if predicted_event_type in bullish_predicted_tags:
-        base += min(0.10, predicted_event_probability * 0.10)
+        base += min(0.10, predicted_event_probability * 0.10) * prediction_weight
     elif predicted_event_type in bearish_predicted_tags:
-        base -= min(0.10, predicted_event_probability * 0.12)
+        base -= min(0.10, predicted_event_probability * 0.12) * prediction_weight
     if signal.source == "mean_reversion" and any(tag in regime.name for tag in ("chop", "range")):
         base += 0.08
     return base * regime.risk_multiplier * execution_quality * cross_asset_factor * rotation_multiplier
@@ -2958,6 +3010,9 @@ def execute_ranked_entries(
         sym_state["entry_liquidity_tier"] = candidate.liquidity_tier
         sym_state["entry_relative_strength"] = candidate.relative_strength
         sym_state["entry_execution_quality"] = candidate.execution_quality
+        sym_state["entry_predicted_event_type"] = "none" if candidate.sentiment is None else candidate.sentiment.predicted_event_type
+        sym_state["entry_predicted_event_probability"] = 0.0 if candidate.sentiment is None else candidate.sentiment.predicted_event_probability
+        sym_state["entry_event_type"] = "none" if candidate.sentiment is None else candidate.sentiment.dominant_event_type
         sym_state["live_stop"] = candidate.signal.stop
         clear_reentry_state(sym_state)
         set_fired(sym_state)
@@ -3116,6 +3171,7 @@ def process_symbol(
     symbol_liquidity_tier = liquidity_tier(symbol)
     symbol_cross_asset_factor = cross_asset_multiplier(symbol, cross_asset) * cross_asset.risk_multiplier
     symbol_rotation_factor = rotation_multiplier_for_symbol(config, symbol, sector_rotation_scores, theme_rotation_scores)
+    prediction_weight = 0.35 if state.get("meta", {}).get("event_prediction_degraded", False) else 1.0
     breakout_signal = build_entry_signal(config, closes, highs, lows, volumes)
     pullback_signal = build_pullback_entry_signal(config, closes, highs, lows, volumes)
     compression_signal = build_compression_breakout_signal(config, closes, highs, lows, volumes)
@@ -3282,6 +3338,7 @@ def process_symbol(
                 execution_quality,
                 symbol_cross_asset_factor,
                 symbol_rotation_factor,
+                prediction_weight,
             ),
             reverse=True,
         )
@@ -3307,6 +3364,7 @@ def process_symbol(
                 execution_quality,
                 symbol_cross_asset_factor,
                 symbol_rotation_factor,
+                prediction_weight,
             )
             candidate_score += twitter_event_score_adjustment(config, sentiment_snapshot, entry_signal)
             candidate = CandidateSetup(
@@ -3383,7 +3441,7 @@ def process_symbol(
             action_label = "sell sentiment"
             pnl_value = (last - position.avg_entry_price) * submitted_qty
             pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
-            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct, trade_metadata_from_state(sym_state))
+            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct, trade_metadata_with_realized_event(sym_state, sentiment_snapshot))
             write_trade(
                 config,
                 symbol,
@@ -3416,7 +3474,7 @@ def process_symbol(
                 action_label = "take profit 1"
                 pnl_value = (last - position.avg_entry_price) * submitted_qty
                 pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
-                update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct, trade_metadata_from_state(sym_state))
+                update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct, trade_metadata_with_realized_event(sym_state, sentiment_snapshot))
                 write_trade(config, symbol, "TP1_SUBMITTED", last, position.avg_entry_price, stop, tp1, tp2, submitted_qty, f"order_id={order.id};pnl_value={pnl_value:.4f};pnl_pct={pnl_pct:.3f}")
                 log_line(config, f"{symbol} TP1 submitted qty={submitted_qty:.8f}")
 
@@ -3431,7 +3489,7 @@ def process_symbol(
             action_label = "take profit 2"
             pnl_value = (last - position.avg_entry_price) * submitted_qty
             pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
-            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct, trade_metadata_from_state(sym_state))
+            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct, trade_metadata_with_realized_event(sym_state, sentiment_snapshot))
             write_trade(
                 config,
                 symbol,
@@ -3457,7 +3515,7 @@ def process_symbol(
             action_label = "stop exit"
             pnl_value = (last - position.avg_entry_price) * submitted_qty
             pnl_pct = ((last / max(position.avg_entry_price, 1e-9)) - 1.0) * 100.0
-            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct, trade_metadata_from_state(sym_state))
+            update_trade_stats(state, symbol, sym_state.get("entry_source", "unknown"), sym_state.get("entry_regime", regime.name), pnl_value, pnl_pct, trade_metadata_with_realized_event(sym_state, sentiment_snapshot))
             write_trade(
                 config,
                 symbol,

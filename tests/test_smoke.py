@@ -776,8 +776,8 @@ class StrategySmokeTests(unittest.TestCase):
 
     def test_build_research_report_aggregates_closed_trades(self):
         state = crypto_trader.default_state(100000.0)
-        crypto_trader.update_trade_stats(state, "BTC/USD", "technical", "trend", 120.0, 3.2, {"theme": "store-of-value", "liquidity_tier": "liquid", "cross_asset_regime": "risk-on", "relative_strength_bucket": "strong", "execution_quality_bucket": "elite"})
-        crypto_trader.update_trade_stats(state, "ETH/USD", "pullback", "trend", -50.0, -1.1, {"theme": "smart-contracts", "liquidity_tier": "liquid", "cross_asset_regime": "neutral", "relative_strength_bucket": "mixed", "execution_quality_bucket": "good"})
+        crypto_trader.update_trade_stats(state, "BTC/USD", "technical", "trend", 120.0, 3.2, {"theme": "store-of-value", "liquidity_tier": "liquid", "cross_asset_regime": "risk-on", "relative_strength_bucket": "strong", "execution_quality_bucket": "elite", "predicted_event_type": "approval", "predicted_event_probability": 0.72, "realized_event_type": "approval", "event_prediction_hit": True})
+        crypto_trader.update_trade_stats(state, "ETH/USD", "pullback", "trend", -50.0, -1.1, {"theme": "smart-contracts", "liquidity_tier": "liquid", "cross_asset_regime": "neutral", "relative_strength_bucket": "mixed", "execution_quality_bucket": "good", "predicted_event_type": "hack", "predicted_event_probability": 0.61, "realized_event_type": "lawsuit", "event_prediction_hit": False})
         report = crypto_trader.build_research_report(state)
         self.assertEqual(report["closed_trades"], 2)
         self.assertIn("technical", report["by_source"])
@@ -787,6 +787,8 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertIn("health", report)
         self.assertIn("by_feature", report)
         self.assertIn("store-of-value", report["by_feature"]["theme"])
+        self.assertIn("event_prediction", report)
+        self.assertEqual(report["event_prediction"]["resolved_count"], 2)
 
     def test_build_research_report_flags_degraded_health_when_expectancy_is_negative(self):
         state = crypto_trader.default_state(100000.0)
@@ -822,10 +824,38 @@ class StrategySmokeTests(unittest.TestCase):
 
     def test_apply_live_source_tuning_disables_negative_source(self):
         state = crypto_trader.default_state(100000.0)
-        report = {"by_source": {"technical": {"count": 5, "expectancy": -10.0}, "pullback": {"count": 5, "expectancy": 4.0}}}
+        report = {"by_source": {"technical": {"count": 5, "expectancy": -10.0}, "pullback": {"count": 5, "expectancy": 4.0}}, "event_prediction": {"resolved_count": 6, "hit_rate": 0.33}}
         artifacts = {"accepted_by_setup": {"technical": 0, "pullback": 4}}
         crypto_trader.apply_live_source_tuning(state, report, artifacts)
         self.assertIn("technical", state["meta"]["disabled_sources"])
+        self.assertTrue(state["meta"]["event_prediction_degraded"])
+
+    def test_trade_metadata_with_realized_event_marks_prediction_hit(self):
+        sym_state = {
+            "entry_theme": "store-of-value",
+            "entry_cross_asset_regime": "risk-on",
+            "entry_liquidity_tier": "liquid",
+            "entry_relative_strength": 0.2,
+            "entry_execution_quality": 0.9,
+            "entry_predicted_event_type": "approval",
+            "entry_predicted_event_probability": 0.7,
+            "entry_event_type": "approval",
+        }
+        snapshot = sentiment.SentimentSnapshot(
+            symbol="BTC/USD",
+            score=0.5,
+            label="bullish",
+            sample_size=2,
+            source_counts={"twitter": 1},
+            items=[],
+            top_headlines=["Approval confirmed"],
+            event_counts={"approval": 1},
+            acceleration=0.2,
+            updated_at=crypto_trader.now_utc(),
+            dominant_event_type="approval",
+        )
+        metadata = crypto_trader.trade_metadata_with_realized_event(sym_state, snapshot)
+        self.assertTrue(metadata["event_prediction_hit"])
 
     def test_detect_behavior_shift_alerts_flags_major_changes(self):
         previous = {"candidate_count": 4, "cross_asset_regime": "risk-on", "top_setup": "technical", "strategy_halt": False}
