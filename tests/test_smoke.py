@@ -126,6 +126,10 @@ def make_config(case_name: str) -> crypto_trader.BotConfig:
         max_order_slices=3,
         spread_guard_bps=18.0,
         microstructure_floor=0.65,
+        var_confidence=0.95,
+        var_window=30,
+        max_portfolio_var=0.018,
+        max_portfolio_es=0.028,
         adaptive_regime_enabled=True,
         adaptive_regime_lookback=252,
         volatility_targeting_enabled=True,
@@ -333,6 +337,23 @@ class StrategySmokeTests(unittest.TestCase):
         context = crypto_trader.correlation_context(config, price_map)
         self.assertTrue(context.is_clustered)
         self.assertLess(context.risk_multiplier, 1.0)
+
+    def test_portfolio_tail_risk_flags_breach_on_large_losses(self):
+        config = make_config("tail_risk")
+        config = crypto_trader.BotConfig(**{**config.__dict__, "var_window": 10})
+        positions = {
+            "BTC/USD": crypto_trader.BrokerPosition("BTC/USD", 1.0, 1.0, 100.0, 100.0, 100.0),
+            "ETH/USD": crypto_trader.BrokerPosition("ETH/USD", 1.0, 1.0, 100.0, 100.0, 100.0),
+        }
+        prices_now = {"BTC/USD": 100.0, "ETH/USD": 100.0}
+        price_map = {
+            "BTC/USD": [100, 98, 96, 94, 90, 86, 84, 82, 80, 78, 76],
+            "ETH/USD": [100, 97, 94, 91, 87, 83, 80, 77, 74, 71, 68],
+        }
+        snap = crypto_trader.portfolio_tail_risk(config, positions, prices_now, price_map, 200.0)
+        self.assertTrue(snap.breach)
+        self.assertGreater(snap.expected_shortfall, 0.0)
+        self.assertLess(snap.risk_multiplier, 1.0)
 
     def test_correlation_overlap_multiplier_penalizes_high_corr_candidate(self):
         config = make_config("correlation_overlap")
@@ -761,9 +782,11 @@ class StrategySmokeTests(unittest.TestCase):
         state["meta"]["consecutive_losses"] = config.max_consecutive_losses
         state["meta"]["no_candidate_loops"] = 4
         state["meta"]["cross_asset"] = {"regime": "risk-off"}
+        state["meta"]["tail_risk"] = {"breach": True, "var": 0.02, "es": 0.03}
         report = {"health": {"status": "degraded"}}
         alerts = crypto_trader.build_runtime_alerts(config, state, report)
         self.assertTrue(any("Daily drawdown halt" in item for item in alerts))
+        self.assertTrue(any("Tail risk breach" in item for item in alerts))
         self.assertTrue(any("risk-off" in item for item in alerts))
 
     def test_build_live_artifact_summary_reads_recent_signal_and_trade_flow(self):

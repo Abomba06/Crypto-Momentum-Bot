@@ -74,6 +74,10 @@ class BacktestConfig:
     max_order_slices: int = 3
     spread_guard_bps: float = 18.0
     microstructure_floor: float = 0.65
+    var_confidence: float = 0.95
+    var_window: int = 30
+    max_portfolio_var: float = 0.018
+    max_portfolio_es: float = 0.028
     event_stream: Dict[str, List[ReplayEvent]] = field(default_factory=dict)
     adaptive_regime_enabled: bool = True
     adaptive_regime_lookback: int = 252
@@ -192,6 +196,10 @@ def as_runtime_config(config: BacktestConfig) -> Any:
         max_order_slices=config.max_order_slices,
         spread_guard_bps=config.spread_guard_bps,
         microstructure_floor=config.microstructure_floor,
+        var_confidence=config.var_confidence,
+        var_window=config.var_window,
+        max_portfolio_var=config.max_portfolio_var,
+        max_portfolio_es=config.max_portfolio_es,
         twitter_primary_enabled=bool(config.event_stream),
         twitter_primary_mode="accelerate",
         twitter_event_max_age_minutes=120,
@@ -277,6 +285,10 @@ def portfolio_runtime_config(config: BacktestConfig) -> Any:
     runtime.max_order_slices = config.max_order_slices
     runtime.spread_guard_bps = config.spread_guard_bps
     runtime.microstructure_floor = config.microstructure_floor
+    runtime.var_confidence = config.var_confidence
+    runtime.var_window = config.var_window
+    runtime.max_portfolio_var = config.max_portfolio_var
+    runtime.max_portfolio_es = config.max_portfolio_es
     runtime.adaptive_regime_enabled = config.adaptive_regime_enabled
     runtime.adaptive_regime_lookback = config.adaptive_regime_lookback
     runtime.volatility_targeting_enabled = config.volatility_targeting_enabled

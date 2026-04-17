@@ -215,6 +215,10 @@ class BotConfig:
     max_order_slices: int
     spread_guard_bps: float
     microstructure_floor: float
+    var_confidence: float
+    var_window: int
+    max_portfolio_var: float
+    max_portfolio_es: float
     adaptive_regime_enabled: bool
     adaptive_regime_lookback: int
     volatility_targeting_enabled: bool
@@ -382,6 +386,10 @@ class BotConfig:
             max_order_slices=int(os.getenv("MAX_ORDER_SLICES", "3")),
             spread_guard_bps=float(os.getenv("SPREAD_GUARD_BPS", "18")),
             microstructure_floor=float(os.getenv("MICROSTRUCTURE_FLOOR", "0.65")),
+            var_confidence=float(os.getenv("VAR_CONFIDENCE", "0.95")),
+            var_window=int(os.getenv("VAR_WINDOW", "30")),
+            max_portfolio_var=float(os.getenv("MAX_PORTFOLIO_VAR", "0.018")),
+            max_portfolio_es=float(os.getenv("MAX_PORTFOLIO_ES", "0.028")),
             adaptive_regime_enabled=os.getenv("ADAPTIVE_REGIME_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
             adaptive_regime_lookback=int(os.getenv("ADAPTIVE_REGIME_LOOKBACK", "252")),
             volatility_targeting_enabled=os.getenv("VOLATILITY_TARGETING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
@@ -478,6 +486,16 @@ class CorrelationContext:
     risk_multiplier: float
     heat_multiplier: float
     is_clustered: bool
+
+
+@dataclass(frozen=True)
+class TailRiskSnapshot:
+    value_at_risk: float
+    expected_shortfall: float
+    worst_return: float
+    sample_count: int
+    risk_multiplier: float
+    breach: bool
 
 
 @dataclass(frozen=True)
@@ -716,6 +734,12 @@ def print_dashboard(
             f"Correlation: avg {safe_float(corr.get('avg')):.2f} | max {safe_float(corr.get('max')):.2f} "
             f"| pairs {int(corr.get('pairs', 0))} | risk x{safe_float(corr.get('risk_multiplier'), 1.0):.2f} "
             f"| heat x{safe_float(corr.get('heat_multiplier'), 1.0):.2f}"
+        )
+    tail = state.get("meta", {}).get("tail_risk", {})
+    if tail:
+        lines.append(
+            f"Tail risk: VaR {safe_float(tail.get('var')):.2%} | ES {safe_float(tail.get('es')):.2%} "
+            f"| worst {safe_float(tail.get('worst')):.2%} | risk x{safe_float(tail.get('risk_multiplier'), 1.0):.2f}"
         )
     reconcile = state.get("meta", {}).get("reconciliation", {})
     if reconcile:
@@ -1485,6 +1509,14 @@ def pairwise_correlation(a: List[float], b: List[float]) -> float:
     return max(-1.0, min(1.0, cov / denom))
 
 
+def percentile(values: List[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = max(0, min(len(ordered) - 1, int(round((len(ordered) - 1) * q))))
+    return ordered[idx]
+
+
 def correlation_context(config: BotConfig, price_map: Dict[str, List[float]]) -> CorrelationContext:
     series_map = {
         symbol: trailing_returns(closes, config.correlation_window)
@@ -1521,6 +1553,57 @@ def correlation_context(config: BotConfig, price_map: Dict[str, List[float]]) ->
         heat_multiplier=max(config.correlation_risk_floor, min(1.0, heat_multiplier)),
         is_clustered=True,
     )
+
+
+def portfolio_tail_risk(
+    config: BotConfig,
+    positions: Dict[str, BrokerPosition],
+    prices_now: Dict[str, float],
+    price_map: Dict[str, List[float]],
+    equity: float,
+) -> TailRiskSnapshot:
+    if equity <= 0 or not positions:
+        return TailRiskSnapshot(0.0, 0.0, 0.0, 0, 1.0, False)
+    exposures: Dict[str, float] = {}
+    for symbol, position in positions.items():
+        if position.qty <= 0:
+            continue
+        last = prices_now.get(symbol, position.current_price)
+        notional = abs(position.qty * last) if is_finite(last) else abs(position.market_value)
+        if notional > 0:
+            exposures[symbol] = notional / max(equity, 1e-9)
+    if not exposures:
+        return TailRiskSnapshot(0.0, 0.0, 0.0, 0, 1.0, False)
+
+    return_series = {
+        symbol: trailing_returns(price_map.get(symbol, []), config.var_window)
+        for symbol in exposures
+    }
+    sample_count = min((len(series) for series in return_series.values() if series), default=0)
+    if sample_count < 5:
+        return TailRiskSnapshot(0.0, 0.0, 0.0, sample_count, 1.0, False)
+
+    portfolio_returns: List[float] = []
+    for idx in range(sample_count):
+        total = 0.0
+        for symbol, weight in exposures.items():
+            series = return_series.get(symbol, [])
+            total += weight * series[-sample_count + idx]
+        portfolio_returns.append(total)
+    losses = sorted(portfolio_returns)
+    tail_q = max(0.0, min(1.0, 1.0 - config.var_confidence))
+    var_level = max(0.0, -percentile(losses, tail_q))
+    tail_losses = [value for value in losses if value <= -var_level] if var_level > 0 else []
+    expected_shortfall = max(0.0, -(sum(tail_losses) / max(len(tail_losses), 1))) if tail_losses else 0.0
+    worst_return = min(losses)
+    risk_multiplier = 1.0
+    breach = False
+    if var_level > config.max_portfolio_var or expected_shortfall > config.max_portfolio_es:
+        breach = True
+        var_excess = var_level / max(config.max_portfolio_var, 1e-9)
+        es_excess = expected_shortfall / max(config.max_portfolio_es, 1e-9)
+        risk_multiplier = max(0.35, 1.0 - (0.18 * max(var_excess - 1.0, 0.0)) - (0.24 * max(es_excess - 1.0, 0.0)))
+    return TailRiskSnapshot(var_level, expected_shortfall, worst_return, sample_count, risk_multiplier, breach)
 
 
 def correlation_overlap_multiplier(
@@ -1856,6 +1939,11 @@ def build_runtime_alerts(config: BotConfig, state: Dict[str, Any], report: Dict[
     if bool(corr.get("clustered")):
         alerts.append(
             f"Correlation cluster detected (avg {safe_float(corr.get('avg')):.2f}, max {safe_float(corr.get('max')):.2f})."
+        )
+    tail = meta.get("tail_risk", {})
+    if bool(tail.get("breach")):
+        alerts.append(
+            f"Tail risk breach: VaR {safe_float(tail.get('var')):.2%}, ES {safe_float(tail.get('es')):.2%}."
         )
     failed_symbols = [
         symbol
@@ -2623,6 +2711,9 @@ def can_open_new_risk(config: BotConfig, state: Dict[str, Any]) -> bool:
         return False
     if int(state.get("meta", {}).get("consecutive_losses", 0)) >= config.max_consecutive_losses:
         return False
+    tail = state.get("meta", {}).get("tail_risk", {})
+    if bool(tail.get("breach")):
+        return False
     return True
 
 
@@ -2697,6 +2788,8 @@ def execute_ranked_entries(
     existing_symbols = [symbol for symbol, position in positions.items() if position.qty > 0]
     corr_context = correlation_context(config, price_context or {})
     effective_heat_cap = config.max_portfolio_heat * corr_context.heat_multiplier
+    tail_state = state.get("meta", {}).get("tail_risk", {})
+    tail_multiplier = max(0.35, min(1.0, safe_float(tail_state.get("risk_multiplier"), 1.0)))
 
     for candidate in ranked:
         if entries_taken >= config.max_entries_per_loop:
@@ -2729,6 +2822,7 @@ def execute_ranked_entries(
                 * liquidity_size_multiplier(config, symbol)
                 * overlap_multiplier
                 * corr_context.risk_multiplier
+                * tail_multiplier
             )
         if buy_qty <= 0:
             set_snapshot_candidate_score(state, symbol, candidate.score)
@@ -3405,6 +3499,15 @@ def run_once(
         "risk_multiplier": round(corr.risk_multiplier, 4),
         "heat_multiplier": round(corr.heat_multiplier, 4),
         "clustered": corr.is_clustered,
+    }
+    tail = portfolio_tail_risk(config, positions, prices_now, benchmark_context, account.equity)
+    meta["tail_risk"] = {
+        "var": round(tail.value_at_risk, 5),
+        "es": round(tail.expected_shortfall, 5),
+        "worst": round(tail.worst_return, 5),
+        "samples": tail.sample_count,
+        "risk_multiplier": round(tail.risk_multiplier, 4),
+        "breach": tail.breach,
     }
     meta["portfolio_heat"] = portfolio_heat(positions, state, prices_now, account.equity)
     meta["sector_exposure"] = sector_exposure(positions, prices_now, account.equity)
