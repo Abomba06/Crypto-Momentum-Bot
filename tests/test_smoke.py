@@ -138,6 +138,7 @@ def make_config(case_name: str) -> crypto_trader.BotConfig:
         sector_rotation_lookback=20,
         sector_rotation_bonus_cap=0.14,
         theme_rotation_bonus_cap=0.12,
+        live_price_max_age_secs=900,
         adaptive_regime_enabled=True,
         adaptive_regime_lookback=252,
         volatility_targeting_enabled=True,
@@ -432,6 +433,30 @@ class StrategySmokeTests(unittest.TestCase):
         snap = crypto_trader.microstructure_snapshot(config, "DOGE/USD", closes, highs, lows, volumes)
         self.assertFalse(snap.allow_entry)
         self.assertLess(snap.score, 0.9)
+
+    def test_live_price_snapshot_falls_back_to_bar_close_when_trade_and_quote_missing(self):
+        config = make_config("live_price_fallback")
+
+        class FakeDataClient(crypto_trader.AlpacaCryptoDataClient):
+            def __init__(self, config):
+                self.config = config
+                self.headers = {}
+                self.calls = 0
+
+            def _get_json(self, path, params):
+                self.calls += 1
+                if "trades/latest" in path:
+                    return {"trades": {}}
+                if "quotes/latest" in path:
+                    return {"quotes": {}}
+                return {}
+
+        client = FakeDataClient(config)
+        fallback_ts = crypto_trader.now_utc()
+        snap = client.fetch_live_price_snapshot("BTC/USD", 123.45, fallback_ts)
+        self.assertEqual(snap.source, "bar_close")
+        self.assertTrue(snap.used_fallback)
+        self.assertTrue(snap.healthy)
 
     def test_execution_slice_count_scales_up_for_large_notional(self):
         config = make_config("slice_count")
@@ -834,10 +859,12 @@ class StrategySmokeTests(unittest.TestCase):
         state["meta"]["no_candidate_loops"] = 4
         state["meta"]["cross_asset"] = {"regime": "risk-off"}
         state["meta"]["tail_risk"] = {"breach": True, "var": 0.02, "es": 0.03}
+        state["meta"]["data_quality"] = {"blocked_symbols": 1, "fallback_symbols": 2}
         report = {"health": {"status": "degraded"}}
         alerts = crypto_trader.build_runtime_alerts(config, state, report)
         self.assertTrue(any("Daily drawdown halt" in item for item in alerts))
         self.assertTrue(any("Tail risk breach" in item for item in alerts))
+        self.assertTrue(any("Data quality blocked" in item or "fallback" in item for item in alerts))
         self.assertTrue(any("risk-off" in item for item in alerts))
 
     def test_build_live_artifact_summary_reads_recent_signal_and_trade_flow(self):

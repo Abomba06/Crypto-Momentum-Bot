@@ -92,6 +92,19 @@ def today_str() -> str:
     return now_utc().date().isoformat()
 
 
+def parse_alpaca_timestamp(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        text = str(value).replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def is_finite(value: Optional[float]) -> bool:
     return value is not None and math.isfinite(value)
 
@@ -227,6 +240,7 @@ class BotConfig:
     sector_rotation_lookback: int
     sector_rotation_bonus_cap: float
     theme_rotation_bonus_cap: float
+    live_price_max_age_secs: int
     adaptive_regime_enabled: bool
     adaptive_regime_lookback: int
     volatility_targeting_enabled: bool
@@ -406,6 +420,7 @@ class BotConfig:
             sector_rotation_lookback=int(os.getenv("SECTOR_ROTATION_LOOKBACK", "20")),
             sector_rotation_bonus_cap=float(os.getenv("SECTOR_ROTATION_BONUS_CAP", "0.14")),
             theme_rotation_bonus_cap=float(os.getenv("THEME_ROTATION_BONUS_CAP", "0.12")),
+            live_price_max_age_secs=int(os.getenv("LIVE_PRICE_MAX_AGE_SECS", "900")),
             adaptive_regime_enabled=os.getenv("ADAPTIVE_REGIME_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
             adaptive_regime_lookback=int(os.getenv("ADAPTIVE_REGIME_LOOKBACK", "252")),
             volatility_targeting_enabled=os.getenv("VOLATILITY_TARGETING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
@@ -513,6 +528,15 @@ class TailRiskSnapshot:
     sample_count: int
     risk_multiplier: float
     breach: bool
+
+
+@dataclass(frozen=True)
+class LivePriceSnapshot:
+    price: float
+    source: str
+    used_fallback: bool
+    stale_seconds: float
+    healthy: bool
 
 
 @dataclass(frozen=True)
@@ -768,6 +792,12 @@ def print_dashboard(
             f"Tail risk: VaR {safe_float(tail.get('var')):.2%} | ES {safe_float(tail.get('es')):.2%} "
             f"| worst {safe_float(tail.get('worst')):.2%} | risk x{safe_float(tail.get('risk_multiplier'), 1.0):.2f}"
         )
+    data_quality = state.get("meta", {}).get("data_quality", {})
+    if data_quality:
+        lines.append(
+            f"Data quality: healthy={int(data_quality.get('healthy_symbols', 0))}/{int(data_quality.get('tracked_symbols', 0))} "
+            f"| fallbacks={int(data_quality.get('fallback_symbols', 0))} | blocked={int(data_quality.get('blocked_symbols', 0))}"
+        )
     reconcile = state.get("meta", {}).get("reconciliation", {})
     if reconcile:
         lines.append(
@@ -832,6 +862,10 @@ def print_dashboard(
                 f"{snapshot.get('regime', 'n/a'):<8} {snapshot.get('cross_asset_regime', 'n/a'):<4} {snapshot.get('trend_label', '?'):<6} "
                 f"{safe_float(snapshot.get('relative_strength')):+5.2f} {sentiment_text:<18} "
                 f"{snapshot.get('setup_label', 'idle'):<12} {snapshot.get('last_action', 'watch')}"
+            )
+            lines.append(
+                f"    data: {snapshot.get('live_price_source', 'n/a')} stale={safe_float(snapshot.get('live_price_stale_seconds')):.0f}s "
+                f"healthy={'yes' if snapshot.get('live_price_healthy', True) else 'no'}"
             )
             headlines = snapshot.get("top_headlines", [])
             if headlines:
@@ -998,6 +1032,9 @@ class AlpacaCryptoDataClient:
         volumes = [float(bar.get("v", 0.0)) for bar in bars]
         return highs, lows, closes, volumes
 
+    def fetch_ltf_bars(self, symbol: str, limit: int) -> List[Dict[str, Any]]:
+        return self._drop_last_if_open_bars(self._try_bars(symbol, self.map_timeframe(self.config.ltf_raw), limit))
+
     def fetch_last_price(self, symbol: str) -> float:
         try:
             if self.config.default_exchange:
@@ -1016,6 +1053,81 @@ class AlpacaCryptoDataClient:
         except RequestException:
             return float("nan")
         return float("nan")
+
+    def fetch_live_price_snapshot(self, symbol: str, fallback_price: float, fallback_ts: Optional[datetime]) -> LivePriceSnapshot:
+        now = now_utc()
+        try:
+            if self.config.default_exchange:
+                payload = self._get_json(
+                    "/v1beta3/crypto/us/trades/latest",
+                    {"symbols": f"{symbol}:{self.config.default_exchange}"},
+                )
+                trade = payload.get("trades", {}).get(f"{symbol}:{self.config.default_exchange}")
+                if trade and "p" in trade:
+                    trade_ts = parse_alpaca_timestamp(trade.get("t")) or now
+                    return LivePriceSnapshot(
+                        price=float(trade["p"]),
+                        source="trade",
+                        used_fallback=False,
+                        stale_seconds=max(0.0, (now - trade_ts).total_seconds()),
+                        healthy=max(0.0, (now - trade_ts).total_seconds()) <= self.config.live_price_max_age_secs,
+                    )
+
+            payload = self._get_json("/v1beta3/crypto/us/trades/latest", {"symbols": symbol})
+            trade = payload.get("trades", {}).get(symbol)
+            if trade and "p" in trade:
+                trade_ts = parse_alpaca_timestamp(trade.get("t")) or now
+                return LivePriceSnapshot(
+                    price=float(trade["p"]),
+                    source="trade",
+                    used_fallback=False,
+                    stale_seconds=max(0.0, (now - trade_ts).total_seconds()),
+                    healthy=max(0.0, (now - trade_ts).total_seconds()) <= self.config.live_price_max_age_secs,
+                )
+        except RequestException:
+            pass
+
+        try:
+            if self.config.default_exchange:
+                payload = self._get_json(
+                    "/v1beta3/crypto/us/quotes/latest",
+                    {"symbols": f"{symbol}:{self.config.default_exchange}"},
+                )
+                quote = payload.get("quotes", {}).get(f"{symbol}:{self.config.default_exchange}")
+                if quote and "bp" in quote and "ap" in quote:
+                    quote_ts = parse_alpaca_timestamp(quote.get("t")) or now
+                    midpoint = (float(quote["bp"]) + float(quote["ap"])) / 2.0
+                    return LivePriceSnapshot(
+                        price=midpoint,
+                        source="quote_mid",
+                        used_fallback=False,
+                        stale_seconds=max(0.0, (now - quote_ts).total_seconds()),
+                        healthy=max(0.0, (now - quote_ts).total_seconds()) <= self.config.live_price_max_age_secs,
+                    )
+
+            payload = self._get_json("/v1beta3/crypto/us/quotes/latest", {"symbols": symbol})
+            quote = payload.get("quotes", {}).get(symbol)
+            if quote and "bp" in quote and "ap" in quote:
+                quote_ts = parse_alpaca_timestamp(quote.get("t")) or now
+                midpoint = (float(quote["bp"]) + float(quote["ap"])) / 2.0
+                return LivePriceSnapshot(
+                    price=midpoint,
+                    source="quote_mid",
+                    used_fallback=False,
+                    stale_seconds=max(0.0, (now - quote_ts).total_seconds()),
+                    healthy=max(0.0, (now - quote_ts).total_seconds()) <= self.config.live_price_max_age_secs,
+                )
+        except RequestException:
+            pass
+
+        fallback_stale = max(0.0, (now - fallback_ts).total_seconds()) if fallback_ts is not None else float(self.config.live_price_max_age_secs + 1)
+        return LivePriceSnapshot(
+            price=fallback_price,
+            source="bar_close",
+            used_fallback=True,
+            stale_seconds=fallback_stale,
+            healthy=math.isfinite(fallback_price) and fallback_stale <= self.config.live_price_max_age_secs,
+        )
 
 
 class AlpacaPaperBroker:
@@ -1751,6 +1863,7 @@ def update_symbol_snapshot(
     relative_strength: float = 0.0,
     execution_quality: float = 1.0,
     cross_asset: Optional[CrossAssetContext] = None,
+    live_price: Optional[LivePriceSnapshot] = None,
 ) -> None:
     sym_state = get_sym_state(state, symbol)
     sym_state["snapshot"] = {
@@ -1769,6 +1882,10 @@ def update_symbol_snapshot(
         "liquidity_tier": liquidity_tier(symbol),
         "cross_asset_regime": None if cross_asset is None else cross_asset.regime,
         "cross_asset_multiplier": 1.0 if cross_asset is None else cross_asset_multiplier(symbol, cross_asset),
+        "live_price_source": "n/a" if live_price is None else live_price.source,
+        "live_price_fallback": False if live_price is None else live_price.used_fallback,
+        "live_price_stale_seconds": 0.0 if live_price is None else live_price.stale_seconds,
+        "live_price_healthy": True if live_price is None else live_price.healthy,
         "sentiment_score": None if sentiment_snapshot is None else sentiment_snapshot.score,
         "sentiment_label": "n/a" if sentiment_snapshot is None else sentiment_snapshot.label,
         "twitter_score": None if sentiment_snapshot is None else sentiment_snapshot.primary_twitter_score,
@@ -2029,6 +2146,11 @@ def build_runtime_alerts(config: BotConfig, state: Dict[str, Any], report: Dict[
         alerts.append(
             f"Tail risk breach: VaR {safe_float(tail.get('var')):.2%}, ES {safe_float(tail.get('es')):.2%}."
         )
+    data_quality = meta.get("data_quality", {})
+    if int(data_quality.get("blocked_symbols", 0)) > 0:
+        alerts.append(f"Data quality blocked entries on {int(data_quality.get('blocked_symbols', 0))} symbols.")
+    elif int(data_quality.get("fallback_symbols", 0)) > 0:
+        alerts.append(f"Using bar-close fallback on {int(data_quality.get('fallback_symbols', 0))} symbols.")
     failed_symbols = [
         symbol
         for symbol, sym_state in state.get("sym", {}).items()
@@ -3323,15 +3445,20 @@ def process_symbol(
         return None
     sym_state["warm_htf_ok"] = True
 
-    highs, lows, closes, volumes = data_client.fetch_ltf_ohlcv(symbol, config.warmup_ltf + 5)
+    ltf_bars = data_client.fetch_ltf_bars(symbol, config.warmup_ltf + 5)
+    highs = [float(bar["h"]) for bar in ltf_bars]
+    lows = [float(bar["l"]) for bar in ltf_bars]
+    closes = [float(bar["c"]) for bar in ltf_bars]
+    volumes = [float(bar.get("v", 0.0)) for bar in ltf_bars]
     if len(closes) < config.warmup_ltf:
         log_line(config, f"Not enough LTF bars for {symbol}")
         sym_state["warm_ltf_ok"] = False
         return None
     sym_state["warm_ltf_ok"] = True
 
-    last_tick = data_client.fetch_last_price(symbol)
-    last = closes[-1] if not math.isfinite(last_tick) else last_tick
+    last_bar_ts = parse_alpaca_timestamp(ltf_bars[-1].get("t")) if ltf_bars else None
+    live_price = data_client.fetch_live_price_snapshot(symbol, closes[-1], last_bar_ts)
+    last = live_price.price
     prices_now[symbol] = last
 
     trend_ok, htf_fast, htf_slow, htf_slope = compute_trend_ok(config, htf_closes)
@@ -3405,6 +3532,7 @@ def process_symbol(
             relative_strength=rel_strength,
             execution_quality=execution_quality,
             cross_asset=cross_asset,
+            live_price=live_price,
         )
         log_line(config, f"{symbol} muted (startup)")
         sym_state["prev_price"] = last
@@ -3427,6 +3555,7 @@ def process_symbol(
             relative_strength=rel_strength,
             execution_quality=execution_quality,
             cross_asset=cross_asset,
+            live_price=live_price,
         )
         log_line(config, f"{symbol} has open orders; waiting.")
         sym_state["prev_price"] = last
@@ -3460,6 +3589,27 @@ def process_symbol(
         if not can_open_new_risk(config, state):
             action_label = "halted"
             log_line(config, "Risk halt reached; entries halted.")
+        elif not live_price.healthy:
+            action_label = "stale data"
+            update_symbol_snapshot(
+                state,
+                symbol,
+                last=last,
+                position=position,
+                trend_ok=trend_ok,
+                trend_value=trend_value,
+                sentiment_snapshot=sentiment_snapshot,
+                entry_signal=entry_signal,
+                last_action=action_label,
+                regime=regime,
+                relative_strength=rel_strength,
+                execution_quality=execution_quality,
+                cross_asset=cross_asset,
+                live_price=live_price,
+            )
+            log_line(config, f"{symbol} entry blocked by stale data source={live_price.source} stale={live_price.stale_seconds:.0f}s")
+            sym_state["prev_price"] = last
+            return None
         elif not trend_ok:
             if not sentiment_triggers_primary_entry(config, sentiment_snapshot):
                 action_label = "trend reject"
@@ -3483,6 +3633,7 @@ def process_symbol(
                     relative_strength=rel_strength,
                     execution_quality=execution_quality,
                     cross_asset=cross_asset,
+                    live_price=live_price,
                 )
                 log_line(config, f"{symbol} sentiment did not confirm long entry.")
                 sym_state["prev_price"] = last
@@ -3503,6 +3654,7 @@ def process_symbol(
                     relative_strength=rel_strength,
                     execution_quality=execution_quality,
                     cross_asset=cross_asset,
+                    live_price=live_price,
                 )
                 log_line(config, f"{symbol} microstructure blocked long entry: spread={micro.spread_bps:.1f}bps score={micro.score:.2f}")
                 sym_state["prev_price"] = last
@@ -3607,6 +3759,7 @@ def process_symbol(
             relative_strength=rel_strength,
             execution_quality=execution_quality,
             cross_asset=cross_asset,
+            live_price=live_price,
         )
         sym_state["prev_price"] = last
         return candidate
@@ -3735,6 +3888,7 @@ def process_symbol(
         relative_strength=rel_strength,
         execution_quality=execution_quality,
         cross_asset=cross_asset,
+        live_price=live_price,
     )
     sym_state["prev_price"] = last
     return None
@@ -3843,6 +3997,13 @@ def run_once(
 
     meta["candidate_count"] = len(candidates)
     meta["no_candidate_loops"] = 0 if candidates else int(meta.get("no_candidate_loops", 0)) + 1
+    snapshots = [state.get("sym", {}).get(symbol, {}).get("snapshot", {}) for symbol in symbols]
+    meta["data_quality"] = {
+        "tracked_symbols": len(symbols),
+        "healthy_symbols": sum(1 for snapshot in snapshots if snapshot.get("live_price_healthy", False)),
+        "fallback_symbols": sum(1 for snapshot in snapshots if snapshot.get("live_price_fallback", False)),
+        "blocked_symbols": sum(1 for snapshot in snapshots if snapshot.get("last_action") == "stale data"),
+    }
     meta["top_candidates"] = [
         {
             "symbol": candidate.symbol,
