@@ -982,6 +982,8 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertIn("summary", result)
         self.assertGreaterEqual(len(result["windows"]), 1)
         self.assertIn("stability_score", result["summary"])
+        self.assertIn("avg_sharpe", result["summary"])
+        self.assertIn("avg_sortino", result["summary"])
 
     def test_portfolio_backtest_returns_multi_symbol_metrics(self):
         idx = pd.date_range("2024-01-01", periods=320, freq="D")
@@ -1036,6 +1038,7 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertGreaterEqual(len(result["top"]), 1)
         self.assertIn("walk_forward", result["best"])
         self.assertIn("robustness", result["best"])
+        self.assertIn("score", result["best"])
 
 
 if __name__ == "__main__":

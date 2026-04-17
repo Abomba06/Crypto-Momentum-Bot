@@ -241,6 +241,19 @@ def compute_metrics(equity_curve: List[float], trades: List[Dict[str, Any]], sta
     closed = [trade for trade in trades if trade.get("exit_price") is not None]
     win_rate = sum(1 for trade in closed if trade.get("pnl_value", 0.0) > 0) / max(len(closed), 1)
     avg_trade_pct = sum(float(trade.get("pnl_pct", 0.0)) for trade in closed) / max(len(closed), 1)
+    returns = [
+        (equity_curve[idx] / max(equity_curve[idx - 1], 1e-9)) - 1.0
+        for idx in range(1, len(equity_curve))
+        if equity_curve[idx - 1] > 0
+    ]
+    mean_return = sum(returns) / max(len(returns), 1)
+    variance = sum((value - mean_return) ** 2 for value in returns) / max(len(returns), 1)
+    std_dev = variance ** 0.5
+    downside = [value for value in returns if value < 0]
+    downside_variance = sum(value**2 for value in downside) / max(len(downside), 1) if downside else 0.0
+    downside_dev = downside_variance ** 0.5
+    sharpe = (mean_return / max(std_dev, 1e-9)) * (252**0.5) if returns else 0.0
+    sortino = (mean_return / max(downside_dev, 1e-9)) * (252**0.5) if returns else 0.0
     return {
         "starting_cash": starting_cash,
         "ending_equity": equity_curve[-1],
@@ -249,7 +262,29 @@ def compute_metrics(equity_curve: List[float], trades: List[Dict[str, Any]], sta
         "closed_trades": len(closed),
         "win_rate": win_rate,
         "avg_trade_pct": avg_trade_pct,
+        "sharpe": sharpe,
+        "sortino": sortino,
     }
+
+
+def optimization_score(metrics: Dict[str, Any], walk_forward_summary: Optional[Dict[str, Any]] = None) -> float:
+    walk_forward_summary = walk_forward_summary or {}
+    return (
+        safe_metric(metrics, "total_return_pct")
+        + (4.0 * safe_metric(metrics, "sharpe"))
+        + (5.0 * safe_metric(metrics, "sortino"))
+        - (0.55 * safe_metric(metrics, "max_drawdown_pct"))
+        + (8.0 * safe_metric(walk_forward_summary, "positive_window_ratio"))
+        + (0.6 * safe_metric(walk_forward_summary, "avg_sortino"))
+    )
+
+
+def safe_metric(source: Dict[str, Any], key: str) -> float:
+    value = source.get(key, 0.0)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def portfolio_runtime_config(config: BacktestConfig) -> Any:
@@ -735,13 +770,11 @@ def walk_forward_validate(df: pd.DataFrame, config: Optional[BacktestConfig] = N
         summary["avg_return_pct"] = result["metrics"]["total_return_pct"]
         summary["avg_max_drawdown_pct"] = result["metrics"]["max_drawdown_pct"]
         summary["avg_win_rate"] = result["metrics"]["win_rate"]
+        summary["avg_sharpe"] = result["metrics"].get("sharpe", 0.0)
+        summary["avg_sortino"] = result["metrics"].get("sortino", 0.0)
         summary["positive_window_ratio"] = 1.0 if result["metrics"]["total_return_pct"] > 0 else 0.0
         summary["worst_window_return_pct"] = result["metrics"]["total_return_pct"]
-        summary["stability_score"] = (
-            result["metrics"]["total_return_pct"]
-            - (0.5 * result["metrics"]["max_drawdown_pct"])
-            + (10.0 * summary["positive_window_ratio"])
-        )
+        summary["stability_score"] = optimization_score(result["metrics"], summary)
         return {"windows": [result["metrics"]], "summary": summary}
 
     windows: List[Dict[str, Any]] = []
@@ -761,14 +794,20 @@ def walk_forward_validate(df: pd.DataFrame, config: Optional[BacktestConfig] = N
         "avg_return_pct": sum(item["total_return_pct"] for item in windows) / max(len(windows), 1),
         "avg_max_drawdown_pct": sum(item["max_drawdown_pct"] for item in windows) / max(len(windows), 1),
         "avg_win_rate": sum(item["win_rate"] for item in windows) / max(len(windows), 1),
+        "avg_sharpe": sum(item.get("sharpe", 0.0) for item in windows) / max(len(windows), 1),
+        "avg_sortino": sum(item.get("sortino", 0.0) for item in windows) / max(len(windows), 1),
         "positive_window_ratio": sum(1 for item in windows if item["total_return_pct"] > 0) / max(len(windows), 1),
         "worst_window_return_pct": min((item["total_return_pct"] for item in windows), default=0.0),
-        "stability_score": (
-            (sum(item["total_return_pct"] for item in windows) / max(len(windows), 1))
-            - (0.5 * (sum(item["max_drawdown_pct"] for item in windows) / max(len(windows), 1)))
-            + (10.0 * (sum(1 for item in windows if item["total_return_pct"] > 0) / max(len(windows), 1)))
-        ),
     }
+    summary["stability_score"] = optimization_score(
+        {
+            "total_return_pct": summary["avg_return_pct"],
+            "max_drawdown_pct": summary["avg_max_drawdown_pct"],
+            "sharpe": summary["avg_sharpe"],
+            "sortino": summary["avg_sortino"],
+        },
+        summary,
+    )
     return {"windows": windows, "summary": summary}
 
 
@@ -790,9 +829,9 @@ def parameter_sweep(
         config = BacktestConfig(**{**base_config.__dict__, **params})
         result = simulate_strategy(df, config)
         metrics = dict(result["metrics"])
-        score = metrics["total_return_pct"] - (0.5 * metrics["max_drawdown_pct"])
         walk_forward = walk_forward_validate(df, config)
         robustness = walk_forward["summary"]["stability_score"]
+        score = optimization_score(metrics, walk_forward["summary"])
         variants.append(
             {
                 "params": params,
