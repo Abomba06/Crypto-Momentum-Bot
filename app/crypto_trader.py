@@ -219,6 +219,9 @@ class BotConfig:
     var_window: int
     max_portfolio_var: float
     max_portfolio_es: float
+    sector_rotation_lookback: int
+    sector_rotation_bonus_cap: float
+    theme_rotation_bonus_cap: float
     adaptive_regime_enabled: bool
     adaptive_regime_lookback: int
     volatility_targeting_enabled: bool
@@ -390,6 +393,9 @@ class BotConfig:
             var_window=int(os.getenv("VAR_WINDOW", "30")),
             max_portfolio_var=float(os.getenv("MAX_PORTFOLIO_VAR", "0.018")),
             max_portfolio_es=float(os.getenv("MAX_PORTFOLIO_ES", "0.028")),
+            sector_rotation_lookback=int(os.getenv("SECTOR_ROTATION_LOOKBACK", "20")),
+            sector_rotation_bonus_cap=float(os.getenv("SECTOR_ROTATION_BONUS_CAP", "0.14")),
+            theme_rotation_bonus_cap=float(os.getenv("THEME_ROTATION_BONUS_CAP", "0.12")),
             adaptive_regime_enabled=os.getenv("ADAPTIVE_REGIME_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
             adaptive_regime_lookback=int(os.getenv("ADAPTIVE_REGIME_LOOKBACK", "252")),
             volatility_targeting_enabled=os.getenv("VOLATILITY_TARGETING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
@@ -457,6 +463,7 @@ class CandidateSetup:
     cross_asset_multiplier: float
     liquidity_tier: str
     theme: str
+    rotation_multiplier: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -722,6 +729,14 @@ def print_dashboard(
             f"Cross-asset: {cross_asset.get('regime', 'neutral')} | BTC trend {safe_float(cross_asset.get('btc_trend_score')):+.2f} "
             f"| ETH trend {safe_float(cross_asset.get('eth_trend_score')):+.2f} | ETH/BTC RS {safe_float(cross_asset.get('eth_vs_btc')):+.3f}"
         )
+    sector_rotation = state.get("meta", {}).get("sector_rotation", {})
+    if sector_rotation:
+        top_sector = max(sector_rotation.items(), key=lambda item: item[1])
+        lines.append(f"Sector lead: {top_sector[0]} {safe_float(top_sector[1]):+.2%}")
+    theme_rotation = state.get("meta", {}).get("theme_rotation", {})
+    if theme_rotation:
+        top_theme_rotation = max(theme_rotation.items(), key=lambda item: item[1])
+        lines.append(f"Theme lead: {top_theme_rotation[0]} {safe_float(top_theme_rotation[1]):+.2%}")
     adaptive = state.get("meta", {}).get("adaptive_regime", {})
     if adaptive:
         lines.append(
@@ -1475,6 +1490,36 @@ def theme_exposure(positions: Dict[str, BrokerPosition], prices_now: Dict[str, f
         theme = theme_for_symbol(symbol)
         exposures[theme] = exposures.get(theme, 0.0) + (notional / equity)
     return exposures
+
+
+def group_rotation_scores(
+    config: BotConfig,
+    price_map: Dict[str, List[float]],
+    grouper,
+) -> Dict[str, float]:
+    grouped: Dict[str, List[float]] = {}
+    for symbol, closes in price_map.items():
+        if len(closes) <= config.sector_rotation_lookback:
+            continue
+        grouped.setdefault(str(grouper(symbol)), []).append(trailing_return(closes, config.sector_rotation_lookback))
+    return {
+        key: sum(values) / max(len(values), 1)
+        for key, values in grouped.items()
+        if values
+    }
+
+
+def rotation_multiplier_for_symbol(
+    config: BotConfig,
+    symbol: str,
+    sector_scores: Dict[str, float],
+    theme_scores: Dict[str, float],
+) -> float:
+    sector_score = safe_float(sector_scores.get(sector_for_symbol(symbol)))
+    theme_score = safe_float(theme_scores.get(theme_for_symbol(symbol)))
+    sector_bonus = max(-config.sector_rotation_bonus_cap, min(config.sector_rotation_bonus_cap, sector_score * 1.8))
+    theme_bonus = max(-config.theme_rotation_bonus_cap, min(config.theme_rotation_bonus_cap, theme_score * 2.0))
+    return max(0.78, min(1.28, 1.0 + sector_bonus + theme_bonus))
 
 
 def trailing_returns(closes: List[float], window: int) -> List[float]:
@@ -2587,6 +2632,7 @@ def score_setup(
     relative_strength: float = 0.0,
     execution_quality: float = 1.0,
     cross_asset_factor: float = 1.0,
+    rotation_multiplier: float = 1.0,
 ) -> float:
     sentiment_score = 0.0 if sentiment_snapshot is None else sentiment_snapshot.score
     acceleration = 0.0 if sentiment_snapshot is None else sentiment_snapshot.acceleration
@@ -2617,7 +2663,7 @@ def score_setup(
         base -= min(0.10, predicted_event_probability * 0.12)
     if signal.source == "mean_reversion" and any(tag in regime.name for tag in ("chop", "range")):
         base += 0.08
-    return base * regime.risk_multiplier * execution_quality * cross_asset_factor
+    return base * regime.risk_multiplier * execution_quality * cross_asset_factor * rotation_multiplier
 
 
 def twitter_event_score_adjustment(config: BotConfig, snapshot: Optional[SentimentSnapshot], signal: Optional[EntrySignal]) -> float:
@@ -2819,6 +2865,7 @@ def execute_ranked_entries(
                 * candidate.regime.risk_multiplier
                 * candidate.execution_quality
                 * candidate.cross_asset_multiplier
+                * candidate.rotation_multiplier
                 * liquidity_size_multiplier(config, symbol)
                 * overlap_multiplier
                 * corr_context.risk_multiplier
@@ -2928,7 +2975,7 @@ def execute_ranked_entries(
             f"atr={candidate.signal.atr_value:.6f};atr_pct={candidate.signal.atr_pct:.4f};"
             f"ema_spread_pct={candidate.signal.ema_spread_pct:.4f};regime={candidate.regime.name};"
             f"reason={candidate.signal.reason};exec_q={candidate.execution_quality:.3f};rs={candidate.relative_strength:.4f};"
-            f"cross_asset={candidate.cross_asset_multiplier:.3f}"
+            f"cross_asset={candidate.cross_asset_multiplier:.3f};rotation={candidate.rotation_multiplier:.3f}"
         )
         if candidate.sentiment is not None:
             note += f";sentiment={candidate.sentiment.score:.3f};sentiment_accel={candidate.sentiment.acceleration:.3f}"
@@ -3021,6 +3068,8 @@ def process_symbol(
     prices_now: Dict[str, float],
     benchmark_context: Dict[str, List[float]],
     cross_asset: CrossAssetContext,
+    sector_rotation_scores: Dict[str, float],
+    theme_rotation_scores: Dict[str, float],
 ) -> Optional[CandidateSetup]:
     sym_state = get_sym_state(state, symbol)
     position = positions.get(symbol)
@@ -3066,6 +3115,7 @@ def process_symbol(
     execution_quality = min(estimate_execution_quality(symbol, atr_pct_live, vol_ratio_live), micro.score)
     symbol_liquidity_tier = liquidity_tier(symbol)
     symbol_cross_asset_factor = cross_asset_multiplier(symbol, cross_asset) * cross_asset.risk_multiplier
+    symbol_rotation_factor = rotation_multiplier_for_symbol(config, symbol, sector_rotation_scores, theme_rotation_scores)
     breakout_signal = build_entry_signal(config, closes, highs, lows, volumes)
     pullback_signal = build_pullback_entry_signal(config, closes, highs, lows, volumes)
     compression_signal = build_compression_breakout_signal(config, closes, highs, lows, volumes)
@@ -3231,6 +3281,7 @@ def process_symbol(
                 rel_strength,
                 execution_quality,
                 symbol_cross_asset_factor,
+                symbol_rotation_factor,
             ),
             reverse=True,
         )
@@ -3255,6 +3306,7 @@ def process_symbol(
                 rel_strength,
                 execution_quality,
                 symbol_cross_asset_factor,
+                symbol_rotation_factor,
             )
             candidate_score += twitter_event_score_adjustment(config, sentiment_snapshot, entry_signal)
             candidate = CandidateSetup(
@@ -3271,6 +3323,7 @@ def process_symbol(
                 cross_asset_multiplier=symbol_cross_asset_factor,
                 liquidity_tier=symbol_liquidity_tier,
                 theme=theme_for_symbol(symbol),
+                rotation_multiplier=symbol_rotation_factor,
             )
             set_snapshot_candidate_score(state, symbol, candidate_score)
             action_label = f"candidate {entry_signal.source}"
@@ -3477,12 +3530,16 @@ def run_once(
             if context_symbol in {"BTC/USD", "ETH/USD"}:
                 log_line(config, f"{context_symbol} benchmark fetch failed: {type(exc).__name__}: {exc}")
     cross_asset = compute_cross_asset_context(config, benchmark_context)
+    sector_rotation_scores = group_rotation_scores(config, benchmark_context, sector_for_symbol)
+    theme_rotation_scores = group_rotation_scores(config, benchmark_context, theme_for_symbol)
     meta["cross_asset"] = {
         "regime": cross_asset.regime,
         "btc_trend_score": round(cross_asset.btc_trend_score, 4),
         "eth_trend_score": round(cross_asset.eth_trend_score, 4),
         "eth_vs_btc": round(cross_asset.eth_vs_btc, 4),
     }
+    meta["sector_rotation"] = {key: round(value, 4) for key, value in sector_rotation_scores.items()}
+    meta["theme_rotation"] = {key: round(value, 4) for key, value in theme_rotation_scores.items()}
     btc_for_adaptive = benchmark_context.get("BTC/USD") or next(iter(benchmark_context.values()), [])
     adaptive = adaptive_regime_state(config, btc_for_adaptive)
     meta["adaptive_regime"] = {
@@ -3529,6 +3586,8 @@ def run_once(
                 prices_now=prices_now,
                 benchmark_context=benchmark_context,
                 cross_asset=cross_asset,
+                sector_rotation_scores=sector_rotation_scores,
+                theme_rotation_scores=theme_rotation_scores,
             )
             if candidate is not None:
                 candidates.append(candidate)

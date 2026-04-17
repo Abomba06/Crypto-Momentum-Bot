@@ -78,6 +78,9 @@ class BacktestConfig:
     var_window: int = 30
     max_portfolio_var: float = 0.018
     max_portfolio_es: float = 0.028
+    sector_rotation_lookback: int = 20
+    sector_rotation_bonus_cap: float = 0.14
+    theme_rotation_bonus_cap: float = 0.12
     event_stream: Dict[str, List[ReplayEvent]] = field(default_factory=dict)
     adaptive_regime_enabled: bool = True
     adaptive_regime_lookback: int = 252
@@ -200,6 +203,9 @@ def as_runtime_config(config: BacktestConfig) -> Any:
         var_window=config.var_window,
         max_portfolio_var=config.max_portfolio_var,
         max_portfolio_es=config.max_portfolio_es,
+        sector_rotation_lookback=config.sector_rotation_lookback,
+        sector_rotation_bonus_cap=config.sector_rotation_bonus_cap,
+        theme_rotation_bonus_cap=config.theme_rotation_bonus_cap,
         twitter_primary_enabled=bool(config.event_stream),
         twitter_primary_mode="accelerate",
         twitter_event_max_age_minutes=120,
@@ -324,6 +330,9 @@ def portfolio_runtime_config(config: BacktestConfig) -> Any:
     runtime.var_window = config.var_window
     runtime.max_portfolio_var = config.max_portfolio_var
     runtime.max_portfolio_es = config.max_portfolio_es
+    runtime.sector_rotation_lookback = config.sector_rotation_lookback
+    runtime.sector_rotation_bonus_cap = config.sector_rotation_bonus_cap
+    runtime.theme_rotation_bonus_cap = config.theme_rotation_bonus_cap
     runtime.adaptive_regime_enabled = config.adaptive_regime_enabled
     runtime.adaptive_regime_lookback = config.adaptive_regime_lookback
     runtime.volatility_targeting_enabled = config.volatility_targeting_enabled
@@ -555,6 +564,9 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
             if symbol in closes
         }
         cross_asset = crypto_trader.compute_cross_asset_context(runtime, benchmark_context)
+        price_context = {symbol: closes[symbol][: idx + 1] for symbol in symbols}
+        sector_rotation_scores = crypto_trader.group_rotation_scores(runtime, price_context, crypto_trader.sector_for_symbol)
+        theme_rotation_scores = crypto_trader.group_rotation_scores(runtime, price_context, crypto_trader.theme_for_symbol)
 
         for symbol in list(positions.keys()):
             window_closes = closes[symbol][: idx + 1]
@@ -623,7 +635,6 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
         candidates: List[crypto_trader.CandidateSetup] = []
         allocated_now = sum(pos["qty"] * prices_now[symbol] for symbol, pos in positions.items())
         account_equity = cash + sum(pos["qty"] * prices_now[symbol] for symbol, pos in positions.items())
-        price_context = {symbol: closes[symbol][: idx + 1] for symbol in symbols}
         corr_context = crypto_trader.correlation_context(runtime, price_context)
         for symbol in symbols:
             if symbol in positions:
@@ -650,6 +661,7 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
             rel_strength = crypto_trader.relative_strength_score(window_closes, benchmark, runtime.rs_lookback)
             micro = crypto_trader.microstructure_snapshot(runtime, symbol, window_closes, window_highs, window_lows, window_volumes)
             execution_quality = min(crypto_trader.estimate_execution_quality(symbol, atr_pct_live, vol_ratio_live), micro.score)
+            rotation_multiplier = crypto_trader.rotation_multiplier_for_symbol(runtime, symbol, sector_rotation_scores, theme_rotation_scores)
             setup_options = []
             breakout_signal = crypto_trader.build_entry_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
             pullback_signal = crypto_trader.build_pullback_entry_signal(runtime, window_closes, window_highs, window_lows, window_volumes)
@@ -685,6 +697,7 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                     rel_strength,
                     execution_quality,
                     crypto_trader.cross_asset_multiplier(symbol, cross_asset) * cross_asset.risk_multiplier,
+                    rotation_multiplier,
                 ),
                 reverse=True,
             )[0]
@@ -704,6 +717,7 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                         rel_strength,
                         execution_quality,
                         crypto_trader.cross_asset_multiplier(symbol, cross_asset) * cross_asset.risk_multiplier,
+                        rotation_multiplier,
                     ),
                     last_price=window_closes[-1],
                     execution_quality=execution_quality,
@@ -711,6 +725,7 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                     cross_asset_multiplier=crypto_trader.cross_asset_multiplier(symbol, cross_asset) * cross_asset.risk_multiplier,
                     liquidity_tier=crypto_trader.liquidity_tier(symbol),
                     theme=crypto_trader.theme_for_symbol(symbol),
+                    rotation_multiplier=rotation_multiplier,
                 )
             )
 
@@ -728,6 +743,7 @@ def simulate_portfolio_strategy(data_map: Dict[str, pd.DataFrame], config: Optio
                 * candidate.regime.risk_multiplier
                 * candidate.execution_quality
                 * candidate.cross_asset_multiplier
+                * candidate.rotation_multiplier
                 * corr_context.risk_multiplier
             )
             fill_price = cost_adjusted_price(candidate.signal.breakout_level, config.fee_bps, config.slippage_bps, "buy")

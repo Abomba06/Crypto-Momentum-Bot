@@ -130,6 +130,9 @@ def make_config(case_name: str) -> crypto_trader.BotConfig:
         var_window=30,
         max_portfolio_var=0.018,
         max_portfolio_es=0.028,
+        sector_rotation_lookback=20,
+        sector_rotation_bonus_cap=0.14,
+        theme_rotation_bonus_cap=0.12,
         adaptive_regime_enabled=True,
         adaptive_regime_lookback=252,
         volatility_targeting_enabled=True,
@@ -395,6 +398,24 @@ class StrategySmokeTests(unittest.TestCase):
         }
         multiplier = crypto_trader.correlation_overlap_multiplier(config, candidate, ["BTC/USD"], accepted, price_map)
         self.assertLess(multiplier, 1.0)
+
+    def test_group_rotation_scores_identify_leading_sector(self):
+        config = make_config("rotation_scores")
+        price_map = {
+            "BTC/USD": [100 + i * 0.5 for i in range(30)],
+            "ETH/USD": [100 + i * 0.45 for i in range(30)],
+            "SOL/USD": [100 + i * 0.8 for i in range(30)],
+            "AVAX/USD": [100 + i * 0.75 for i in range(30)],
+        }
+        scores = crypto_trader.group_rotation_scores(config, price_map, crypto_trader.sector_for_symbol)
+        self.assertGreater(scores["layer1"], scores["majors"])
+
+    def test_rotation_multiplier_rewards_leading_theme(self):
+        config = make_config("rotation_multiplier")
+        sector_scores = {"layer1": 0.12, "majors": 0.03}
+        theme_scores = {"high-beta-layer1": 0.11, "store-of-value": 0.02}
+        multiplier = crypto_trader.rotation_multiplier_for_symbol(config, "SOL/USD", sector_scores, theme_scores)
+        self.assertGreater(multiplier, 1.0)
 
     def test_microstructure_snapshot_blocks_wide_spread_entry(self):
         config = make_config("microstructure")
